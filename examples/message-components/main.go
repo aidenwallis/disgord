@@ -5,7 +5,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/andersfylling/disgord"
+	"github.com/aidenwallis/disgord"
 )
 
 var (

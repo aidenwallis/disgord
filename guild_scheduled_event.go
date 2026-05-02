@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/andersfylling/disgord/internal/endpoint"
-	"github.com/andersfylling/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/internal/endpoint"
+	"github.com/aidenwallis/disgord/internal/httd"
 )
 
 type GuildScheduledEvent struct {

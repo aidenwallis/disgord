@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/andersfylling/disgord/internal/gateway"
-	"github.com/andersfylling/disgord/internal/gateway/cmd"
-	"github.com/andersfylling/disgord/internal/httd"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/gateway"
+	"github.com/aidenwallis/disgord/internal/gateway/cmd"
+	"github.com/aidenwallis/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/json"
 )
 
 func (c *Client) Gateway() GatewayQueryBuilder {

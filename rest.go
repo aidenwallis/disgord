@@ -10,12 +10,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/andersfylling/disgord/internal/util/stringslice"
+	"github.com/aidenwallis/disgord/internal/util/stringslice"
 
-	"github.com/andersfylling/disgord/internal/constant"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/constant"
+	"github.com/aidenwallis/disgord/json"
 
-	"github.com/andersfylling/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/internal/httd"
 )
 
 type ErrRest = httd.ErrREST

@@ -4,7 +4,7 @@
 //
 // Create a Disgord client to get access to the REST API and gateway functionality. In the following example, we listen for new messages and respond with "hello".
 //
-// Session interface: https://pkg.go.dev/github.com/andersfylling/disgord?tab=doc#Session
+// Session interface: https://pkg.go.dev/github.com/aidenwallis/disgord?tab=doc#Session
 //
 //	client := disgord.New(disgord.Config{
 //	  BotToken: "my-secret-bot-token",
@@ -133,12 +133,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/andersfylling/disgord/internal/gateway"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/gateway"
+	"github.com/aidenwallis/disgord/json"
 
-	"github.com/andersfylling/disgord/internal/util"
+	"github.com/aidenwallis/disgord/internal/util"
 
-	"github.com/andersfylling/disgord/internal/constant"
+	"github.com/aidenwallis/disgord/internal/constant"
 )
 
 const Name = constant.Name

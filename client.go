@@ -9,16 +9,16 @@ import (
 	"sync"
 	"time"
 
-	evt "github.com/andersfylling/disgord/internal/event"
+	evt "github.com/aidenwallis/disgord/internal/event"
 
 	"golang.org/x/net/proxy"
 
-	"github.com/andersfylling/disgord/internal/gateway"
-	"github.com/andersfylling/disgord/internal/logger"
+	"github.com/aidenwallis/disgord/internal/gateway"
+	"github.com/aidenwallis/disgord/internal/logger"
 
-	"github.com/andersfylling/disgord/internal/constant"
+	"github.com/aidenwallis/disgord/internal/constant"
 
-	"github.com/andersfylling/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/internal/httd"
 )
 
 var DefaultHttpClient = &http.Client{}

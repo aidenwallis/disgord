@@ -5,8 +5,8 @@ import (
 	"mime/multipart"
 	"strings"
 
-	"github.com/andersfylling/disgord/internal/httd"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/json"
 )
 
 type InteractionType = int

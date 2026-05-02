@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/andersfylling/disgord"
+	"github.com/aidenwallis/disgord"
 )
 
 type clientRESTMock struct {

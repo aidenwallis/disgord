@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andersfylling/disgord/internal/logger"
+	"github.com/aidenwallis/disgord/internal/logger"
 )
 
 var token = os.Getenv("DISGORD_TOKEN_INTEGRATION_TEST")

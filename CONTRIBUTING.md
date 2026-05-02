@@ -89,7 +89,7 @@ module github.com/myusername/bot
 go 1.15
 
 require (
-	github.com/andersfylling/disgord v0.24.0
+	github.com/aidenwallis/disgord v0.24.0
 )
 ```
 
@@ -100,13 +100,13 @@ module github.com/myusername/bot
 go 1.15
 
 require (
-	github.com/andersfylling/disgord v0.24.0
+	github.com/aidenwallis/disgord v0.24.0
 )
 
-replace github.com/andersfylling/disgord => ../disgord
+replace github.com/aidenwallis/disgord => ../disgord
 ```
 
-We have now stated that the `github.com/andersfylling/disgord` dependency can be found at the relative path `../disgord`. Such that any time you make changes to your disgord folder and run/build your bot, it will fetch the disgord code from `../disgord`. This allows you to test your changes immediately.
+We have now stated that the `github.com/aidenwallis/disgord` dependency can be found at the relative path `../disgord`. Such that any time you make changes to your disgord folder and run/build your bot, it will fetch the disgord code from `../disgord`. This allows you to test your changes immediately.
 
 
 ## What Should I Know Before I Get Started?

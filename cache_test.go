@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/json"
 )
 
 func jsonbytes(format string, args ...interface{}) []byte {

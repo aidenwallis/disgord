@@ -3,7 +3,7 @@ module example
 go 1.17
 
 require (
-	github.com/andersfylling/disgord v0.35.1
+	github.com/aidenwallis/disgord v0.35.1
 	github.com/sirupsen/logrus v1.9.0
 )
 
@@ -17,4 +17,4 @@ require (
 	nhooyr.io/websocket v1.8.7 // indirect
 )
 
-replace github.com/andersfylling/disgord => ../../
+replace github.com/aidenwallis/disgord => ../../

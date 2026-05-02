@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andersfylling/disgord/internal/gateway/opcode"
-	"github.com/andersfylling/disgord/internal/logger"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/gateway/opcode"
+	"github.com/aidenwallis/disgord/internal/logger"
+	"github.com/aidenwallis/disgord/json"
 
 	"go.uber.org/atomic"
 )

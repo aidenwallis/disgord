@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/andersfylling/disgord/internal/endpoint"
-	"github.com/andersfylling/disgord/internal/httd"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/endpoint"
+	"github.com/aidenwallis/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/json"
 )
 
 // VoiceState Voice State structure

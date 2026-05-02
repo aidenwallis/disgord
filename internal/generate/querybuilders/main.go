@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	PKGName = "github.com/andersfylling/disgord"
+	PKGName = "github.com/aidenwallis/disgord"
 )
 
 var noStruct struct{}

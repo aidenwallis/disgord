@@ -4,7 +4,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/andersfylling/disgord/internal/gateway/opcode"
+	"github.com/aidenwallis/disgord/internal/gateway/opcode"
 )
 
 func newClientPktQueue(limit int) clientPktQueue {

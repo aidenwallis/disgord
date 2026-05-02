@@ -3,7 +3,7 @@ package gateway
 import (
 	"sync"
 
-	"github.com/andersfylling/disgord/internal/gateway/opcode"
+	"github.com/aidenwallis/disgord/internal/gateway/opcode"
 )
 
 // inline

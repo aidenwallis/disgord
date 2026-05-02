@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/andersfylling/disgord"
+	"github.com/aidenwallis/disgord"
 	"github.com/sirupsen/logrus"
 )
 

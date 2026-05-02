@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/json"
 )
 
 // Resource represents a discord event.

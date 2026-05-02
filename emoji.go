@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/andersfylling/disgord/internal/endpoint"
-	"github.com/andersfylling/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/internal/endpoint"
+	"github.com/aidenwallis/disgord/internal/httd"
 )
 
 func validEmojiName(name string) bool {

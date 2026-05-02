@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/andersfylling/disgord/internal/disgorderr"
+	"github.com/aidenwallis/disgord/internal/disgorderr"
 )
 
 // TODO: go generate from internal/errors/*

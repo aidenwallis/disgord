@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andersfylling/disgord/internal/logger"
+	"github.com/aidenwallis/disgord/internal/logger"
 )
 
 func TestThreadEndpoints(t *testing.T) {

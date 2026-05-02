@@ -22,7 +22,7 @@ To change the json dependency, you simply import the disgord/json package and ad
 Here the standard json implementation is swapped out with jsoniter:
 ```go
 import (
-    "github.com/andersfylling/disgord/json"
+    "github.com/aidenwallis/disgord/json"
     jsoniter "github.com/json-iterator/go"
 )
 
