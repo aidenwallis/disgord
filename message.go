@@ -126,7 +126,7 @@ type MessageComponent struct {
 	Style       int                  `json:"style"`
 	Label       string               `json:"label"`
 	Emoji       *Emoji               `json:"emoji"`
-	CustomID    string               `json:"custom_id"`
+	CustomID    string               `json:"custom_id,omitempty"`
 	Url         string               `json:"url,omitempty"`
 	Disabled    bool                 `json:"disabled"`
 	Components  []*MessageComponent  `json:"components,omitempty"`
