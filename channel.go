@@ -12,9 +12,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/andersfylling/disgord/internal/endpoint"
-	"github.com/andersfylling/disgord/internal/httd"
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/internal/endpoint"
+	"github.com/aidenwallis/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/json"
 )
 
 // ChannelType https://discord.com/developers/docs/resources/channel#channel-object-channel-types

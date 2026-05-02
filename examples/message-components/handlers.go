@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/andersfylling/disgord"
+	"github.com/aidenwallis/disgord"
 )
 
 var (

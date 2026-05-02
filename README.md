@@ -4,10 +4,10 @@
     <a href="https://codecov.io/gh/andersfylling/disgord">
       <img src="https://codecov.io/gh/andersfylling/disgord/branch/develop/graph/badge.svg" />
     </a>
-    <a href='https://goreportcard.com/report/github.com/andersfylling/disgord'>
-      <img src='https://goreportcard.com/badge/github.com/andersfylling/disgord' alt='Code coverage' />
+    <a href='https://goreportcard.com/report/github.com/aidenwallis/disgord'>
+      <img src='https://goreportcard.com/badge/github.com/aidenwallis/disgord' alt='Code coverage' />
     </a>
-    <a href='https://pkg.go.dev/github.com/andersfylling/disgord'>
+    <a href='https://pkg.go.dev/github.com/aidenwallis/disgord'>
       <img src="https://pkg.go.dev/badge/andersfylling/disgord" alt="PkgGoDev">
     </a>
   </p>
@@ -47,11 +47,11 @@ client := disgord.New(disgord.Config{
 ## Starter guide
 > This project uses [Go Modules](https://github.com/golang/go/wiki/Modules) for dealing with dependencies, remember to activate module support in your IDE
 
-> Examples can be found in [examples](examples) and some open source projects Disgord projects in the [wiki](https://pkg.go.dev/github.com/andersfylling/disgord?tab=importedby)
+> Examples can be found in [examples](examples) and some open source projects Disgord projects in the [wiki](https://pkg.go.dev/github.com/aidenwallis/disgord?tab=importedby)
 
-I highly suggest reading the [Discord API documentation](https://discord.com/developers/docs/intro) and the [Disgord go doc](https://pkg.go.dev/github.com/andersfylling/disgord?tab=doc).
+I highly suggest reading the [Discord API documentation](https://discord.com/developers/docs/intro) and the [Disgord go doc](https://pkg.go.dev/github.com/aidenwallis/disgord?tab=doc).
 
-Simply use [this github template](https://github.com/andersfylling/disgord-starter) to create your first new bot!
+Simply use [this github template](https://github.com/aidenwallis/disgord-starter) to create your first new bot!
 
 
 ## API / Interface
@@ -104,13 +104,13 @@ Remember to have stringer installed to run go generate:
 `go get -u golang.org/x/tools/cmd/stringer`
 
 ## Sponsors
-> [JetBrains](https://www.jetbrains.com/?from=github.com/andersfylling/disgord)
+> [JetBrains](https://www.jetbrains.com/?from=github.com/aidenwallis/disgord)
 
 A Special thanks to the following companies for sponsoring this project!
 
 
 <div align='left'>
-  <a href="https://www.jetbrains.com/?from=github.com/andersfylling/disgord">
+  <a href="https://www.jetbrains.com/?from=github.com/aidenwallis/disgord">
     <img src="/.github/jetbrains-variant-4.svg" alt="JetBrains" width="200px" />
   </a>
 </div>
@@ -118,7 +118,7 @@ A Special thanks to the following companies for sponsoring this project!
 #### Software used
 
 <div align='left'>
-  <a href="https://www.jetbrains.com/go/?from=github.com/andersfylling/disgord">
+  <a href="https://www.jetbrains.com/go/?from=github.com/aidenwallis/disgord">
     <img src="/.github/icon-goland.svg" alt="GoLand" width="150px" />
   </a>
 </div>
@@ -129,7 +129,7 @@ A Special thanks to the following companies for sponsoring this project!
 ```Markdown
 1. How do I find my bot token and/or add my bot to a server?
 
-Tutorial here: https://github.com/andersfylling/disgord/wiki/Get-bot-token-and-add-it-to-a-server
+Tutorial here: https://github.com/aidenwallis/disgord/wiki/Get-bot-token-and-add-it-to-a-server
 ```
 
 ```Markdown

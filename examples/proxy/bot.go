@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"github.com/andersfylling/disgord"
+	"github.com/aidenwallis/disgord"
 )
 
 // In the event that the Discord connections need to be routed

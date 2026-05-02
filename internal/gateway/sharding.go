@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andersfylling/disgord/internal/constant"
-	"github.com/andersfylling/disgord/internal/gateway/cmd"
-	"github.com/andersfylling/disgord/internal/logger"
+	"github.com/aidenwallis/disgord/internal/constant"
+	"github.com/aidenwallis/disgord/internal/gateway/cmd"
+	"github.com/aidenwallis/disgord/internal/logger"
 )
 
 const defaultShardRateLimit time.Duration = 5*time.Second + 100*time.Millisecond

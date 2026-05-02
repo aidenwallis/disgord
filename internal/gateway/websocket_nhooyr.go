@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/json"
 
 	"go.uber.org/atomic"
 

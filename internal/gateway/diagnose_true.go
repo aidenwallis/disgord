@@ -12,9 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/json"
 
-	"github.com/andersfylling/disgord/internal/gateway/opcode"
+	"github.com/aidenwallis/disgord/internal/gateway/opcode"
 )
 
 const SaveIncomingPackets = true

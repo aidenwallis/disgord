@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/andersfylling/disgord/json"
+	"github.com/aidenwallis/disgord/json"
 
-	"github.com/andersfylling/disgord/internal/endpoint"
-	"github.com/andersfylling/disgord/internal/httd"
+	"github.com/aidenwallis/disgord/internal/endpoint"
+	"github.com/aidenwallis/disgord/internal/httd"
 )
 
 // NOTE! Credit for defining the Permission consts in a clean way goes to DiscordGo.

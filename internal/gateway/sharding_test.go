@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andersfylling/disgord/internal/gateway/cmd"
-	"github.com/andersfylling/disgord/internal/logger"
+	"github.com/aidenwallis/disgord/internal/gateway/cmd"
+	"github.com/aidenwallis/disgord/internal/logger"
 )
 
 type GatewayBotGetterMock struct {

@@ -4,8 +4,8 @@ package disgordutil
 
 import (
     "context"
-    "github.com/andersfylling/disgord"
-    "github.com/andersfylling/disgord/internal/gateway"
+    "github.com/aidenwallis/disgord"
+    "github.com/aidenwallis/disgord/internal/gateway"
     "net/url"
 )
 

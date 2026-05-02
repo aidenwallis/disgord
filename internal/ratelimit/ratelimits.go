@@ -1,7 +1,7 @@
 package ratelimit
 
 import (
-	"github.com/andersfylling/disgord/internal/util"
+	"github.com/aidenwallis/disgord/internal/util"
 )
 
 type Snowflake = util.Snowflake

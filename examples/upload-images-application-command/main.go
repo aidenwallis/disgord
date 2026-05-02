@@ -4,7 +4,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/andersfylling/disgord"
+	"github.com/aidenwallis/disgord"
 )
 
 func interaction(session disgord.Session, evt *disgord.InteractionCreate) {
