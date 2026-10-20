@@ -45,11 +45,14 @@ func (q *TicketQueue) Delete(ticket Ticket) {
 		return
 	}
 
-	if i == len(q.tickets)-1 {
-		q.tickets = q.tickets[:i]
-	} else {
-		q.tickets = append(q.tickets[i:], q.tickets[i+1:]...)
-	}
+	q.tickets = append(q.tickets[:i], q.tickets[i+1:]...)
+}
+
+// Len returns the number of tickets waiting in the queue.
+func (q *TicketQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.tickets)
 }
 
 func (q *TicketQueue) Next(ticket Ticket, cb func() bool) bool {
