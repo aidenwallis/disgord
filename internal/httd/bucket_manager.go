@@ -1,6 +1,7 @@
 package httd
 
 import (
+	"strings"
 	"sync"
 )
 
@@ -49,8 +50,8 @@ func NewManager(defaultRelations map[string]string) *Manager {
 type Manager struct {
 	mu sync.RWMutex
 
-	// proxy links a local endpoint hash to a discord defined rate limit ltBucket hash
-	// when no discord ltBucket hash is known, the value and the key are the same
+	// proxy links a local endpoint hash to a bucket key derived from the discord defined rate limit ltBucket hash
+	// (see consolidatedBucketKey). When no discord ltBucket hash is known, the value and the key are the same
 	proxy   map[string]string
 	buckets map[string]*ltBucket
 
@@ -87,16 +88,16 @@ func (r *Manager) ProxyID(id string) (pID string) {
 	return pID
 }
 
-func (r *Manager) UpdateProxyID(id, pID, bucketHash string) {
-	if bucketHash == "" || bucketHash == pID {
+func (r *Manager) UpdateProxyID(id, pID, bucketKey string) {
+	if bucketKey == "" || bucketKey == pID {
 		return
 	}
 
 	r.mu.Lock()
-	if _, exists := r.buckets[bucketHash]; !exists {
-		r.buckets[bucketHash] = r.buckets[r.proxy[id]]
+	if _, exists := r.buckets[bucketKey]; !exists {
+		r.buckets[bucketKey] = r.buckets[r.proxy[id]]
 	}
-	r.proxy[id] = bucketHash
+	r.proxy[id] = bucketKey
 	r.mu.Unlock()
 }
 
@@ -117,10 +118,40 @@ func (r *Manager) Bucket(id string, cb func(bucket RESTBucket)) {
 	}
 
 	cb(bucket)
-	bucket.mu.RLock()
-	hash := bucket.hash
-	bucket.mu.RUnlock()
-	r.UpdateProxyID(id, pID, hash)
+	r.UpdateProxyID(id, pID, consolidatedBucketKey(bucket.getHash(), id))
+}
+
+// consolidatedBucketKey returns the key of the bucket shared by every endpoint that Discord reports with the given
+// bucket hash. Discord's hash does not include the major parameter, which is rate limited separately.
+func consolidatedBucketKey(hash, localKey string) string {
+	if hash == "" || hash == GlobalHash {
+		return hash
+	}
+	return hash + "|" + majorParam(localKey)
+}
+
+// majorParam extracts the major parameter (channel, guild or webhook id + token) from a local key: METHOD:/path.
+func majorParam(localKey string) string {
+	i := strings.IndexByte(localKey, '/')
+	if i < 0 {
+		return ""
+	}
+	segments := strings.Split(localKey[i+1:], "/")
+	if len(segments) < 2 || segments[1] == "" {
+		return ""
+	}
+
+	switch segments[0] {
+	case "channels", "guilds":
+		return segments[0] + "/" + segments[1]
+	case "webhooks":
+		if len(segments) > 2 && segments[2] != "" {
+			return segments[0] + "/" + segments[1] + "/" + segments[2]
+		}
+		return segments[0] + "/" + segments[1]
+	default:
+		return ""
+	}
 }
 
 func (r *Manager) Consolidate() {
