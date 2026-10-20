@@ -327,9 +327,9 @@ func TestLifecycle31_ConnectWhileStopping(t *testing.T) {
 	}
 }
 
-// 46: dials that ignore their ctx (legacy proxies) never wedge the shard: at most maxAbandonedDials are left
-// running, Disconnect returns promptly, a later Connect works once a slot frees up, and late connections are
-// closed without ever being used.
+// 46: dials that ignore their ctx (legacy proxies) use bounded resources: at most maxAbandonedDials are left
+// running, Disconnect returns promptly, attempts resume (and a later Connect works) once a slot frees up, and late
+// connections are closed without ever being used. If all of them stay stuck forever, no further dial is made.
 func TestLifecycle46_StalledDialsIgnoringCtx(t *testing.T) {
 	to := fastTimeouts()
 	to.dial = 50 * time.Millisecond

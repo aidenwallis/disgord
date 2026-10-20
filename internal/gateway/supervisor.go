@@ -62,6 +62,12 @@ func defaultTimeouts() timeouts {
 	}
 }
 
+// writeAccept bounds how long a control frame may wait for the writer to accept it: long enough for a frame
+// already in flight to finish (that write is bounded by t.write itself).
+func (t timeouts) writeAccept() time.Duration {
+	return 2 * t.write
+}
+
 func (t timeouts) withDefaults() timeouts {
 	d := defaultTimeouts()
 	fill := func(v *time.Duration, def time.Duration) {
@@ -545,7 +551,7 @@ func (c *EvtClient) establish(r *run, sess *session, resumable, viaResumeURL boo
 			CmdName: event.Resume,
 		}
 		c.mu.Unlock()
-		err = sess.writeControl(pkt, c.to.write)
+		err = sess.writeControl(pkt, c.to.writeAccept())
 	} else {
 		out.phase = phaseIdentify
 		c.setState(stateIdentifying, "")
@@ -954,7 +960,7 @@ func (c *EvtClient) identifyTurn(q *identifyRequest) error {
 	c.seq, c.hasSeq = 0, false
 	c.mu.Unlock()
 
-	err := sess.writeControl(c.identifyPacket(), c.to.write)
+	err := sess.writeControl(c.identifyPacket(), c.to.writeAccept())
 	if errors.Is(err, errWriteNotAccepted) {
 		return errIdentifyNotSent
 	}
@@ -973,14 +979,8 @@ func (c *EvtClient) identifyPacket() *clientPacket {
 func (c *EvtClient) awaitIdentify(r *run, sess *session) error {
 	for regrants := 0; ; {
 		q, attached := c.requestIdentify(r, sess)
-		select {
-		case <-sess.identified:
-			return sess.identifyErr
-		case <-sess.failed:
-			return errWriteNotAccepted
-		case <-r.ctx.Done():
-			return ErrDisconnected
-		case <-q.done:
+		if done, err := c.awaitIdentifyCall(r, sess, q, attached); done {
+			return err
 		}
 
 		select {
@@ -999,6 +999,32 @@ func (c *EvtClient) awaitIdentify(r *run, sess *session) error {
 			return fmt.Errorf("identify queue: %w", q.err)
 		}
 		// the turn was granted while no session was ready for it; ask for another one
+	}
+}
+
+// awaitIdentifyCall waits for the identify queue call q to return. done is true when the wait ended for another
+// reason (the session identified or failed, or the run stopped); err is then the result for awaitIdentify.
+func (c *EvtClient) awaitIdentifyCall(r *run, sess *session, q *identifyRequest, attached bool) (done bool, err error) {
+	var warn <-chan time.Time
+	if !attached {
+		// only a misbehaving custom ConnectQueue keeps a call running after invoking its callback
+		ticker := time.NewTicker(c.to.teardownJoinWarn)
+		defer ticker.Stop()
+		warn = ticker.C
+	}
+	for {
+		select {
+		case <-sess.identified:
+			return true, sess.identifyErr
+		case <-sess.failed:
+			return true, errWriteNotAccepted
+		case <-r.ctx.Done():
+			return true, ErrDisconnected
+		case <-warn:
+			c.log.Error(c.getLogPrefix(), "still waiting for a previous identify queue call to return; is the ConnectQueue blocking after running its callback?")
+		case <-q.done:
+			return false, nil
+		}
 	}
 }
 

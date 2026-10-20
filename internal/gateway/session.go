@@ -732,6 +732,8 @@ func (s *session) sendHeartbeat(budget *outboundBudget, scheduled bool) bool {
 			}
 		}
 	} else if budget.used(now) >= hardCap {
+		// requested heartbeats may use the reserve meant for scheduled ones; the worst case is this reconnect,
+		// never a missed heartbeat deadline or more than hardCap frames per window
 		c.log.Error(s.prefix(), "outbound rate limit exhausted, a requested heartbeat can not be answered; reconnecting")
 		s.fail(failReason{kind: failOutboundExhausted})
 		return false

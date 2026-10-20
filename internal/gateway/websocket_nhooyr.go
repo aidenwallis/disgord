@@ -99,8 +99,8 @@ func (g *nhooyr) Close() (err error) {
 //
 // Known limitation of nhooyr v1.8.7: if Close takes the read lock before our receiver does, it consumes the peer's
 // close frame itself and the peer's close code is lost (later reads report our own code, which is ignored as an
-// echo). A fatal code sent at that moment therefore costs one extra connection attempt; the next connection
-// receives it through the receiver and the shard stops.
+// echo). A fatal code sent at that moment can therefore be lost: the shard keeps retrying with the normal backoff
+// until a fatal code reaches the receiver, which then stops it.
 func (g *nhooyr) CloseWithStatus(code int, reason string) error {
 	return g.closeWith(websocket.StatusCode(code), reason)
 }
