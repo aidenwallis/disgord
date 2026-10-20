@@ -213,11 +213,16 @@ func TestScenario06b_HalfOpenWriterBlocked(t *testing.T) {
 	rc.expectRecovery(t, fc.idx+1, 30*time.Second)
 }
 
-// 7: op 7 -> RESUME.
+// 7: op 7 -> RESUME, which does not wait for an identify turn (B4).
 func TestScenario07_Op7(t *testing.T) {
 	t.Parallel()
 	gw := newScenario(t, 500)
-	rc := newTestShard(t, gw, shardOpts{})
+	var queueCalls atomic.Int32
+	queue := func(_ uint, cb func() error) error {
+		queueCalls.Inc()
+		return cb()
+	}
+	rc := newTestShard(t, gw, shardOpts{connectQueue: queue})
 	fc := rc.connect(t)
 	_ = fc.send(map[string]interface{}{"op": 7, "d": nil})
 	next := rc.expectRecovery(t, fc.idx+1, 20*time.Second)
@@ -226,6 +231,9 @@ func TestScenario07_Op7(t *testing.T) {
 	}
 	if code := fc.clientClose.Load(); code != 4000 {
 		t.Fatalf("expected the client to close the old connection with 4000, got %d", code)
+	}
+	if n := queueCalls.Load(); n != 1 {
+		t.Fatalf("only the initial IDENTIFY may go through the connect queue, got %d queue calls", n)
 	}
 }
 
