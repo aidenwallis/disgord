@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/aidenwallis/disgord/internal/gateway"
 	"github.com/aidenwallis/disgord/internal/gateway/cmd"
@@ -56,11 +57,17 @@ func (g gatewayQueryBuilder) Connect() (err error) {
 	//
 	// also verifies that the correct credentials were supplied
 
-	// Avoid races during connection setup
+	// The client lock is only held while configuring and publishing the shard manager: event handlers (such as
+	// BotReady) use it as soon as the first READY is dispatched, and holding the lock while the shards connect
+	// would block Dispatch and everything else that needs it. Publishing it also rejects overlapping Connects.
 	g.client.mu.Lock()
-	defer g.client.mu.Unlock()
+	if g.client.shardManager != nil {
+		g.client.mu.Unlock()
+		return errors.New("the gateway is already connected or connecting; Connect can only be called once per client")
+	}
 
 	if err = gateway.ConfigureShardConfig(g.ctx, helperGatewayBotGetter{g.client}, &g.client.config.ShardConfig); err != nil {
+		g.client.mu.Unlock()
 		return err
 	}
 
@@ -85,7 +92,10 @@ func (g gatewayQueryBuilder) Connect() (err error) {
 
 	sharding := gateway.NewShardMngr(shardMngrConf)
 
+	// published before connecting; it stays published on failure so Disconnect can stop the shards
+	g.client.shardManager = sharding
 	g.client.setupConnectEnv()
+	g.client.mu.Unlock()
 
 	g.client.log.Info("Connecting to discord Gateway")
 	if err = sharding.Connect(); err != nil {
@@ -94,22 +104,48 @@ func (g gatewayQueryBuilder) Connect() (err error) {
 	}
 
 	g.client.log.Info("Connected")
-	g.client.shardManager = sharding
 	return nil
 }
 
-// Disconnect closes the discord websocket connection
+// gatewayShutdown makes Disconnect safe to call concurrently and to retry: the shutdown channels are closed
+// exactly once and every call waits for the same shard manager shutdown.
+// TODO: move onto Client once client.go can be changed alongside it.
+type gatewayShutdown struct {
+	dispatcherOnce sync.Once
+	systemOnce     sync.Once
+}
+
+var gatewayShutdowns sync.Map // *Client -> *gatewayShutdown
+
+func gatewayShutdownFor(c *Client) *gatewayShutdown {
+	v, _ := gatewayShutdowns.LoadOrStore(c, &gatewayShutdown{})
+	return v.(*gatewayShutdown)
+}
+
+// Disconnect closes the discord websocket connection. It may be retried if it returned an error (e.g. a shard did
+// not stop in time); a Client can not be connected again afterwards.
 func (g gatewayQueryBuilder) Disconnect() (err error) {
 	fmt.Println() // to keep ^C on it's own line
 	g.client.log.Info("Closing Discord gateway connection")
-	close(g.client.dispatcher.shutdown)
-	if err = g.client.shardManager.Disconnect(); err != nil {
-		g.client.log.Error(err)
-		return err
-	}
-	close(g.client.shutdownChan)
-	g.client.log.Info("Disconnected")
+	state := gatewayShutdownFor(g.client)
+	state.dispatcherOnce.Do(func() {
+		close(g.client.dispatcher.shutdown)
+	})
 
+	g.client.mu.RLock()
+	sharding := g.client.shardManager
+	g.client.mu.RUnlock()
+	if sharding != nil {
+		if err = sharding.Disconnect(); err != nil {
+			g.client.log.Error(err)
+			return err
+		}
+	}
+
+	state.systemOnce.Do(func() {
+		close(g.client.shutdownChan)
+	})
+	g.client.log.Info("Disconnected")
 	return nil
 }
 

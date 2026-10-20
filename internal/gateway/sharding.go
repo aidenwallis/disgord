@@ -216,6 +216,21 @@ type shardMngr struct {
 
 	sync         *shardSync
 	connectQueue connectQueue
+
+	// mrun is the only manager lifecycle state: the shards' runs started by one Connect. It stays set until
+	// every one of those runs retired, so a new Connect can never overlap with an old one.
+	// Lock order: s.mu -> EvtClient.lifecycleMu -> EvtClient.mu.
+	mrun        *mrun
+	mrunCounter uint64
+}
+
+// mrun is one manager Connect .. Disconnect lifetime.
+type mrun struct {
+	id       uint64
+	runs     map[shardID]*run
+	stopOnce sync.Once
+	stopping chan struct{} // closed when stopping was initiated
+	stopped  chan struct{} // closed once every run retired and s.mrun was cleared
 }
 
 var _ ShardManager = (*shardMngr)(nil)
@@ -248,6 +263,8 @@ func (s *shardMngr) initShards() error {
 
 		// other
 		SystemShutdown: s.conf.ShutdownChan,
+		// NOTE: not invoked by the event client. Autoscaling on 4011 is not wired: this listener would re-lock
+		// s.mu and race the shard lifecycle; 4011 stops the shard with an error instead.
 		discordErrListener: func(code int, reason string) {
 			if code != discordErrShardScalingRequired {
 				return
@@ -299,39 +316,180 @@ func (s *shardMngr) initShards() error {
 	return nil
 }
 
+// Connect starts every shard concurrently (their identifies are spaced by the connect queue) and returns once
+// all of them are READY. If any shard fails to start, every shard is stopped and the error is returned.
 func (s *shardMngr) Connect() (err error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if m := s.mrun; m != nil {
+		s.mu.Unlock()
+		select {
+		case <-m.stopping:
+			return ErrStopping
+		default:
+			return ErrAlreadyConnected
+		}
+	}
 
 	if len(s.conf.ShardIDs) == 0 {
+		s.mu.Unlock()
 		return errors.New("no shard ids has been registered")
 	}
 
 	if len(s.shards) == 0 {
 		if err = s.initShards(); err != nil {
+			s.mu.Unlock()
 			return err
 		}
 	}
 
-	for _, shard := range s.shards {
-		if err := shard.Connect(); err != nil {
-			return err
+	// registration is atomic: a concurrent Disconnect either sees no run at all or every started shard
+	s.mrunCounter++
+	m := &mrun{
+		id:       s.mrunCounter,
+		runs:     make(map[shardID]*run, len(s.shards)),
+		stopping: make(chan struct{}),
+		stopped:  make(chan struct{}),
+	}
+	for id, shard := range s.shards {
+		r, startErr := shard.start()
+		if startErr != nil {
+			err = fmt.Errorf("shard %d: %w", id, startErr)
+			break
+		}
+		m.runs[id] = r
+	}
+	s.mrun = m
+	s.mu.Unlock()
+
+	if err == nil {
+		err = s.awaitStartup(m)
+	}
+	if err != nil {
+		s.conf.Logger.Error("unable to start the shards:", err)
+		s.stop(m)
+		if waitErr := s.awaitStopped(m); waitErr != nil {
+			s.conf.Logger.Error("shards did not stop after the failed startup:", waitErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// awaitStartup waits until every shard reported READY. A shard that becomes READY and then stops (e.g. a fatal
+// close code) while others are still starting fails the startup as well.
+func (s *shardMngr) awaitStartup(m *mrun) error {
+	type result struct {
+		id         shardID
+		err        error
+		terminated bool
+	}
+	results := make(chan result, 2*len(m.runs))
+	barrierDone := make(chan struct{})
+	defer close(barrierDone)
+
+	for id, r := range m.runs {
+		id, r := id, r
+		go func() {
+			err := r.waitFirst()
+			results <- result{id: id, err: err}
+			if err != nil {
+				return
+			}
+			select {
+			case <-r.done:
+				results <- result{id: id, terminated: true}
+			case <-barrierDone:
+			}
+		}()
+	}
+
+	for pending := len(m.runs); pending > 0; {
+		select {
+		case res := <-results:
+			switch {
+			case res.terminated:
+				return fmt.Errorf("shard %d stopped while other shards were starting", res.id)
+			case res.err != nil:
+				return fmt.Errorf("shard %d: %w", res.id, res.err)
+			}
+			pending--
+		case <-m.stopping:
+			return ErrDisconnected
 		}
 	}
 	return nil
 }
-func (s *shardMngr) Disconnect() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	for _, shard := range s.shards {
-		err := shard.Disconnect()
-		if err != nil {
-			s.conf.Logger.Error("Disconnect error (trivial):", err)
+// stop initiates the retirement of every run started by m (never "whatever run a shard has now"). It does not
+// block; callers wait on m.stopped.
+func (s *shardMngr) stop(m *mrun) {
+	m.stopOnce.Do(func() {
+		close(m.stopping)
+
+		s.mu.RLock()
+		shards := make(map[shardID]*EvtClient, len(m.runs))
+		for id := range m.runs {
+			shards[id] = s.shards[id]
 		}
-		shard.resetSession()
+		s.mu.RUnlock()
+
+		go func() {
+			var wg sync.WaitGroup
+			for id, r := range m.runs {
+				id, r, shard := id, r, shards[id]
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if err := shard.stopRun(r); err != nil {
+						s.conf.Logger.Error("shard", id, "is still stopping:", err)
+					}
+					<-r.done
+					shard.resetSession()
+				}()
+			}
+			wg.Wait()
+
+			s.mu.Lock()
+			if s.mrun == m {
+				s.mrun = nil
+			}
+			s.mu.Unlock()
+			close(m.stopped)
+		}()
+	})
+}
+
+func (s *shardMngr) stopTimeout() time.Duration {
+	to := defaultTimeouts()
+	if s.conf.timeouts != nil {
+		to = s.conf.timeouts.withDefaults()
 	}
-	return nil
+	return to.disconnect + 5*time.Second
+}
+
+func (s *shardMngr) awaitStopped(m *mrun) error {
+	t := time.NewTimer(s.stopTimeout())
+	defer t.Stop()
+	select {
+	case <-m.stopped:
+		return nil
+	case <-t.C:
+		return ErrDisconnectTimeout
+	}
+}
+
+// Disconnect stops every shard and waits (bounded) until they all retired. Concurrent calls, and a retry after
+// ErrDisconnectTimeout, wait for the same shutdown.
+func (s *shardMngr) Disconnect() error {
+	s.mu.RLock()
+	m := s.mrun
+	s.mu.RUnlock()
+	if m == nil {
+		return nil
+	}
+
+	s.stop(m)
+	return s.awaitStopped(m)
 }
 
 func (s *shardMngr) LocalShardCount() uint {
@@ -349,6 +507,8 @@ func (s *shardMngr) ShardCount() uint {
 }
 
 func (s *shardMngr) ShardIDs() (shardIDs []uint) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for id := range s.shards {
 		shardIDs = append(shardIDs, id)
 	}
@@ -356,7 +516,8 @@ func (s *shardMngr) ShardIDs() (shardIDs []uint) {
 }
 
 // Emit splits up and dispatches the payload into the correct shards
-// returns the guild ids it can not support and a error message
+// returns the guild ids it can not support and a error message.
+// It must not call any method that takes s.mu again (a pending writer would deadlock the read lock).
 func (s *shardMngr) Emit(cmd string, payload CmdPayload) (guildIDs []Snowflake, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -375,7 +536,7 @@ func (s *shardMngr) Emit(cmd string, payload CmdPayload) (guildIDs []Snowflake, 
 
 		requests := make(map[uint][]Snowflake)
 		for i := range t.GuildIDs {
-			shardID := GetShardForGuildID(t.GuildIDs[i], s.ShardCount())
+			shardID := GetShardForGuildID(t.GuildIDs[i], s.conf.ShardCount)
 			requests[shardID] = append(requests[shardID], t.GuildIDs[i])
 		}
 
@@ -392,7 +553,7 @@ func (s *shardMngr) Emit(cmd string, payload CmdPayload) (guildIDs []Snowflake, 
 			}
 		}
 	case *UpdateVoiceStatePayload:
-		shardID := GetShardForGuildID(t.GuildID, s.ShardCount())
+		shardID := GetShardForGuildID(t.GuildID, s.conf.ShardCount)
 		if shard, ok := s.shards[shardID]; ok {
 			err = shard.Emit(cmd, payload)
 		} else {
@@ -422,6 +583,8 @@ func (s *shardMngr) GetShard(shardID shardID) (shard *EvtClient, err error) {
 }
 
 func (s *shardMngr) HeartbeatLatencies() (latencies map[shardID]time.Duration, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	latencies = make(map[shardID]time.Duration)
 	for id := range s.shards {
 		latencies[id], err = s.shards[id].HeartbeatLatency()

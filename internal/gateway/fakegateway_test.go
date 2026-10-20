@@ -153,6 +153,8 @@ type fakeGateway struct {
 	sessCounter int
 	nonces      map[string]chan struct{}
 	resumeURL   string // resume_gateway_url sent in READY; defaults to URL
+	// identifyCloseShard answers the next IDENTIFY of a shard with a close code (once)
+	identifyCloseShard map[uint]int
 
 	dialAttempts     atomic.Int32
 	failDials        atomic.Int32 // respond HTTP 500 to the next N upgrade attempts
@@ -218,8 +220,10 @@ func newFakeGateway(t *testing.T, log *testLogger) *fakeGateway {
 		log:      log,
 		sessions: map[string]*fakeSession{},
 		nonces:   map[string]chan struct{}{},
-		closing:  make(chan struct{}),
-		newConn:  make(chan *fakeConn, 1000),
+
+		identifyCloseShard: map[uint]int{},
+		closing:            make(chan struct{}),
+		newConn:            make(chan *fakeConn, 1000),
 	}
 	gw.hbIntervalMs.Store(500)
 	gw.closeAfterWSCode.Store(4000)
@@ -443,6 +447,16 @@ func (fc *fakeConn) readLoop() {
 			}
 			_ = stdjson.Unmarshal(p.D, &id)
 			gw.mu.Lock()
+			if len(id.Shard) == 2 {
+				if code, ok := gw.identifyCloseShard[id.Shard[0]]; ok {
+					delete(gw.identifyCloseShard, id.Shard[0])
+					gw.mu.Unlock()
+					fc.shardID.Store(int32(id.Shard[0]))
+					gw.log.Server("conn #%d IDENTIFY shard=%v -> close %d (injected)", fc.idx, id.Shard, code)
+					fc.closeWith(code, "injected")
+					continue
+				}
+			}
 			gw.sessCounter++
 			s := &fakeSession{id: fmt.Sprintf("sess-%d", gw.sessCounter), valid: true}
 			if len(id.Shard) == 2 {
