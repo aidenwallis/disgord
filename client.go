@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -21,7 +20,10 @@ import (
 	"github.com/aidenwallis/disgord/internal/httd"
 )
 
-var DefaultHttpClient = &http.Client{}
+// DefaultHttpClient is used for REST requests and websocket connections when Config does not specify a client.
+// Its transport is a clone of http.DefaultTransport that also limits the wait for response headers. Changing it
+// affects every Client relying on it.
+var DefaultHttpClient = &http.Client{Transport: newTransport(nil)}
 
 // New create a Client. But panics on configuration/setup errors.
 func New(conf Config) *Client {
@@ -60,29 +62,20 @@ func createClient(ctx context.Context, conf *Config) (c *Client, err error) {
 	if conf.Logger == nil {
 		conf.Logger = logger.Empty{}
 	}
-	if conf.HTTPClient == nil {
-		// WARNING: do not set http.Client.Timeout (!)
-		conf.HTTPClient = DefaultHttpClient
-	} else if conf.HTTPClient.Timeout > 0 {
-		// https://github.com/nhooyr/websocket/issues/67
-		return nil, errors.New("do not set timeout in the http.Client, use context.Context instead")
-	}
+	// http.Client.Timeout is fine for websockets as well: nhooyr only applies it to the dial / handshake.
+	defaultClient := DefaultHttpClient
 	if conf.Proxy != nil {
-		conf.HTTPClient.Transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, e error) {
-				return conf.Proxy.Dial(network, addr)
-			},
-		}
+		// only clients that are not explicitly configured are routed through the proxy
+		defaultClient = &http.Client{Transport: newTransport(conf.Proxy)}
+	}
+	if conf.HTTPClient == nil {
+		conf.HTTPClient = defaultClient
 	}
 	if conf.HttpClient == nil {
-		if conf.HTTPClient != nil {
-			conf.HttpClient = conf.HTTPClient
-		} else {
-			return nil, errors.New("missing configured HTTP client")
-		}
+		conf.HttpClient = conf.HTTPClient
 	}
 	if conf.WebsocketHttpClient == nil {
-		conf.WebsocketHttpClient = DefaultHttpClient
+		conf.WebsocketHttpClient = defaultClient
 	}
 
 	const DMIntents = IntentDirectMessageReactions | IntentDirectMessages | IntentDirectMessageTyping
@@ -142,9 +135,10 @@ func createClient(ctx context.Context, conf *Config) (c *Client, err error) {
 		UserAgentSourceURL:           constant.GitHubURL,
 		UserAgentVersion:             constant.Version,
 		UserAgentExtra:               conf.ProjectName,
-		HttpClient:                   conf.HTTPClient,
+		HttpClient:                   conf.HttpClient,
 		CancelRequestWhenRateLimited: conf.CancelRequestWhenRateLimited,
 		RESTBucketManager:            conf.RESTBucketManager,
+		RequestTimeout:               conf.RESTRequestTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -172,7 +166,8 @@ func createClient(ctx context.Context, conf *Config) (c *Client, err error) {
 	}
 
 	// websocket sharding
-	evtChan := make(chan *gateway.Event, 2) // TODO: higher value when more shards?
+	// shared by all shards; absorbs event bursts (eg. GUILD_CREATE on connect) without blocking the shards
+	evtChan := make(chan *gateway.Event, 256)
 
 	// event dispatcher
 	dispatch := newDispatcher()
@@ -233,14 +228,30 @@ type Config struct {
 	// Note that rate limiting is not done in the roundtripper layer at this point, so anything with re-tries, logic
 	// that triggers a new http request without going through Disgord interface, will not be rate limited and this
 	// can cause you to get banned in the long term. Be careful.
-	HttpClient          HttpClientDoer
+	//
+	// HttpClient is used for REST requests and takes precedence over HTTPClient. When neither is set,
+	// DefaultHttpClient is used. Custom clients don't get the transport timeouts of DefaultHttpClient, but
+	// RESTRequestTimeout still applies.
+	HttpClient HttpClientDoer
+
+	// WebsocketHttpClient is used to dial the gateway, defaults to DefaultHttpClient. http.Client.Timeout only
+	// limits the dial and handshake.
 	WebsocketHttpClient *http.Client // no way around this, sadly. At least for now.
 
 	// Deprecated: use WebsocketHttpClient and HttpClient
 	HTTPClient *http.Client
 
+	// Proxy is used for the REST and websocket clients that are not explicitly configured (DefaultHttpClient
+	// itself is not modified). A proxy.ContextDialer is used when implemented, a plain proxy.Dialer can not be
+	// cancelled.
+	//
 	// Deprecated: use WebsocketHttpClient and HttpClient
 	Proxy proxy.Dialer
+
+	// RESTRequestTimeout limits each REST request/response exchange, including reading the response body, when
+	// the request context has no deadline. Time spent waiting for rate limits is not included.
+	// Defaults to 2 minutes, a negative value disables it.
+	RESTRequestTimeout time.Duration
 
 	// Intents can be specified to reduce traffic sent from the discord gateway.
 	//  Intents = IntentDirectMessages | IntentGuildMessages
