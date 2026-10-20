@@ -220,3 +220,64 @@ func TestGatewayDisconnect_RetryAndConcurrent(t *testing.T) {
 		}
 	})
 }
+
+type blockedDiscovery struct {
+	started     chan struct{}
+	startedOnce sync.Once
+	release     chan struct{}
+}
+
+func (rt *blockedDiscovery) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.startedOnce.Do(func() { close(rt.started) })
+	select {
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	case <-rt.release:
+		return nil, context.Canceled
+	}
+}
+
+// Review item 8: gateway discovery (GET /gateway/bot) runs outside the client lock; Disconnect cancels a startup
+// that has not published a shard manager yet, and overlapping Connects are still rejected meanwhile.
+func TestGatewayDisconnectCancelsDiscovery(t *testing.T) {
+	rt := &blockedDiscovery{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(rt.release)
+	client, err := NewClient(context.Background(), Config{
+		BotToken:           "test-token",
+		HTTPClient:         &http.Client{Transport: rt},
+		RESTRequestTimeout: -1, // the transport honours context cancellation
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	connectDone := make(chan error, 1)
+	go func() { connectDone <- client.Gateway().Connect() }()
+	<-rt.started
+
+	if err := client.Gateway().Connect(); err == nil {
+		t.Fatal("an overlapping Connect must be rejected while the first one discovers the gateway")
+	}
+
+	disconnectDone := make(chan error, 1)
+	go func() { disconnectDone <- client.Gateway().Disconnect() }()
+	select {
+	case err := <-disconnectDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect blocked behind gateway discovery")
+	}
+	select {
+	case err := <-connectDone:
+		if err == nil {
+			t.Fatal("Connect must fail after Disconnect cancelled the startup")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled startup did not return")
+	}
+	if client.getShardManager() != nil {
+		t.Fatal("a cancelled startup must not publish a shard manager")
+	}
+}

@@ -55,54 +55,72 @@ func (g gatewayQueryBuilder) Connect() (err error) {
 	// only works for socketing
 	//
 	// also verifies that the correct credentials were supplied
+	client := g.client
+	ctx := g.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	// The client lock is only held while configuring and publishing the shard manager: event handlers (such as
-	// BotReady) use it as soon as the first READY is dispatched, and holding the lock while the shards connect
-	// would block Dispatch and everything else that needs it. Publishing it also rejects overlapping Connects.
-	g.client.mu.Lock()
-	if g.client.shardManager != nil {
-		g.client.mu.Unlock()
+	// The client lock is never held across gateway discovery (a REST call) or while the shards connect: Disconnect,
+	// Dispatch and READY handlers (BotReady uses the shard manager) need it. A registered startup rejects
+	// overlapping Connects and can be cancelled by Disconnect until the shard manager is published.
+	client.mu.Lock()
+	if client.shardManager != nil || client.gatewayStartupCancel != nil {
+		client.mu.Unlock()
 		return errors.New("the gateway is already connected or connecting; Connect can only be called once per client")
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	client.gatewayStartupCancel = cancel
+	shardConfig := client.config.ShardConfig
+	client.mu.Unlock()
 
-	if err = gateway.ConfigureShardConfig(g.ctx, helperGatewayBotGetter{g.client}, &g.client.config.ShardConfig); err != nil {
-		g.client.mu.Unlock()
+	err = gateway.ConfigureShardConfig(ctx, helperGatewayBotGetter{client}, &shardConfig)
+
+	client.mu.Lock()
+	client.gatewayStartupCancel = nil
+	if err == nil && ctx.Err() != nil {
+		err = fmt.Errorf("gateway connect cancelled: %w", ctx.Err())
+	}
+	if err != nil {
+		client.mu.Unlock()
 		return err
 	}
+	client.config.ShardConfig = shardConfig
 
 	shardMngrConf := gateway.ShardManagerConfig{
-		HTTPClient:   g.client.WebsocketHttpClient,
-		ShardConfig:  g.client.config.ShardConfig,
-		Logger:       g.client.config.Logger,
-		ShutdownChan: g.client.config.shutdownChan,
-		Intents:      g.client.config.Intents,
-		EventChan:    g.client.eventChan,
+		HTTPClient:   client.WebsocketHttpClient,
+		ShardConfig:  shardConfig,
+		Logger:       client.config.Logger,
+		ShutdownChan: client.config.shutdownChan,
+		Intents:      client.config.Intents,
+		EventChan:    client.eventChan,
 		DisgordInfo:  LibraryInfo(),
-		ProjectName:  g.client.config.ProjectName,
-		BotToken:     g.client.config.BotToken,
+		ProjectName:  client.config.ProjectName,
+		BotToken:     client.config.BotToken,
 	}
 
-	if g.client.config.Presence != nil {
-		if g.client.config.Presence.Status == "" {
-			g.client.config.Presence.Status = StatusOnline // default
+	if client.config.Presence != nil {
+		if client.config.Presence.Status == "" {
+			client.config.Presence.Status = StatusOnline // default
 		}
-		shardMngrConf.DefaultBotPresence = g.client.config.Presence
+		shardMngrConf.DefaultBotPresence = client.config.Presence
 	}
 
 	sharding := gateway.NewShardMngr(shardMngrConf)
 
 	// published before connecting; it stays published on failure so Disconnect can stop the shards
-	g.client.shardManager = sharding
-	g.client.setupConnectEnv()
-	g.client.mu.Unlock()
+	client.shardManager = sharding
+	client.setupConnectEnv()
+	client.mu.Unlock()
 
-	g.client.log.Info("Connecting to discord Gateway")
+	client.log.Info("Connecting to discord Gateway")
 	if err = sharding.Connect(); err != nil {
-		g.client.log.Info(err)
+		client.log.Info(err)
 		return err
 	}
 
-	g.client.log.Info("Connected")
+	client.log.Info("Connected")
 	return nil
 }
 
@@ -115,7 +133,16 @@ func (g gatewayQueryBuilder) Disconnect() (err error) {
 		close(g.client.dispatcher.shutdown)
 	})
 
-	if sharding := g.client.getShardManager(); sharding != nil {
+	// cancelling a pending startup and reading the manager under one lock means a startup either published its
+	// manager (and is stopped below) or will see the cancellation and never publish one
+	g.client.mu.Lock()
+	if g.client.gatewayStartupCancel != nil {
+		g.client.gatewayStartupCancel()
+	}
+	sharding := g.client.shardManager
+	g.client.mu.Unlock()
+
+	if sharding != nil {
 		if err = sharding.Disconnect(); err != nil {
 			g.client.log.Error(err)
 			return err

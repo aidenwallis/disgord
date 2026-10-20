@@ -346,6 +346,10 @@ type Client struct {
 	dispatcherShutdownOnce sync.Once
 	systemShutdownOnce     sync.Once
 
+	// gatewayStartupCancel is set (under mu) while Gateway().Connect discovers the gateway, so Disconnect can
+	// cancel a startup that has not published a shard manager yet
+	gatewayStartupCancel context.CancelFunc
+
 	connectedGuilds      []Snowflake
 	connectedGuildsMutex sync.RWMutex
 
