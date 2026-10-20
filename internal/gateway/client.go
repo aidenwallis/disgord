@@ -129,7 +129,7 @@ type client struct {
 	ShardID uint
 
 	// sending and receiving data
-	ratelimit        ratelimiter
+	ratelimit        *ratelimiter
 	receiveChan      chan *DiscordPacket
 	internalEmitChan chan *clientPacket
 	emitChan         chan *clientPacket
@@ -481,6 +481,7 @@ func (c *client) receiver(ctx context.Context) {
 	var noopCounter int
 
 	internal, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	once := sync.Once{}
 
 	for {

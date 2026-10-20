@@ -57,8 +57,8 @@ func (s *UniqueStringSlice) Remove(id string) {
 	}
 }
 
-func newRatelimiter() ratelimiter {
-	rl := ratelimiter{
+func newRatelimiter() *ratelimiter {
+	rl := &ratelimiter{
 		buckets: map[string]rlBucket{},
 		global:  newRatelimitBucket(120, 60),
 	}

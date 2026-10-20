@@ -239,10 +239,10 @@ func TestEvtClient_communication(t *testing.T) {
 
 	wg2 := sync.WaitGroup{}
 	wg2.Add(1)
+	wg[heartbeat].Add(1)
+	wg[identify].Add(1)
 	go func() {
 		// send hello packet
-		wg[heartbeat].Add(1)
-		wg[identify].Add(1)
 		conn.reading <- []byte(`{"t":null,"s":null,"op":10,"d":{"heartbeat_interval":45000,"_trace":["discord-gateway-prd-1-99"]}}`)
 		wg[heartbeat].Wait()
 		wg[identify].Wait()

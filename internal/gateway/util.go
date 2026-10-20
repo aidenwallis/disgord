@@ -44,21 +44,14 @@ func CmdNameToOpCode(command string, t ClientType) (op opcode.OpCode) {
 	return op
 }
 
-// rotateByTime every timestamp after "limit" is deleted. Assumes the oldest entries are first.
+// rotateByTime deletes every timestamp before "limit". Assumes the oldest entries are first.
 func rotateByTime(times []time.Time, limit time.Time) []time.Time {
 	var delim int
-	for i := range times {
-		if times[i].After(limit) {
-			delim++
-		} else {
-			break
-		}
+	for delim < len(times) && times[delim].Before(limit) {
+		delim++
 	}
 
-	// shift
-	for i := 0; i+delim < len(times); i++ {
-		times[i] = times[delim+i]
-	}
-
-	return times[:len(times)-delim]
+	// shift to avoid re-allocations
+	n := copy(times, times[delim:])
+	return times[:n]
 }
