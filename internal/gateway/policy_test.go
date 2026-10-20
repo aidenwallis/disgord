@@ -209,7 +209,7 @@ func TestOutboundBudget(t *testing.T) {
 
 // nhooyr wrapper methods must not panic before Open succeeded (base: nil pointer dereference on Disconnect).
 func TestNhooyrWrapperNilSafe(t *testing.T) {
-	g := newSessionConn(nil, time.Second)
+	g := newSessionConn(nil, time.Second, time.Second)
 	if err := g.WriteJSON(map[string]int{"op": 1}); err == nil {
 		t.Fatal("expected an error writing to an unopened connection")
 	}

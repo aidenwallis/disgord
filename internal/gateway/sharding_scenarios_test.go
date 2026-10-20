@@ -567,3 +567,27 @@ func TestManager_ShutdownWhileStarting(t *testing.T) {
 		t.Fatalf("shards still running after shutdown: %v", tm.running())
 	}
 }
+
+// Review item 2: READY and termination are separate results; the barrier must never report success when a shard
+// already retired, and must report its terminal error.
+func TestManagerStartupRejectsRetiredShard(t *testing.T) {
+	fatal := newCloseError(4014)
+	for i := 0; i < 1000; i++ {
+		// A reaches READY and stops fatally before B reaches READY
+		a := &run{first: make(chan error, 1), done: make(chan struct{}), terminal: fatal}
+		a.first <- nil
+		close(a.done)
+		b := &run{first: make(chan error, 1), done: make(chan struct{})}
+		b.first <- nil
+		m := &mrun{
+			runs:     map[shardID]*run{0: a, 1: b},
+			stopping: make(chan struct{}),
+			stopped:  make(chan struct{}),
+		}
+		err := (&shardMngr{}).awaitStartup(m)
+		var closeErr *GatewayCloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != 4014 {
+			t.Fatalf("schedule %d: expected the retired shard's fatal error, got %v", i, err)
+		}
+	}
+}

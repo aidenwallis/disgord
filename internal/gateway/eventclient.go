@@ -65,9 +65,9 @@ func NewEventClient(shardID uint, conf *EvtConfig) (client *EvtClient, err error
 		client.connectQueue = func(_ uint, cb func() error) error { return cb() }
 	}
 	if client.newConn == nil {
-		httpClient, writeTimeout := conf.HTTPClient, to.write
+		httpClient, writeTimeout, closeTimeout := conf.HTTPClient, to.write, to.closeHandshake
 		client.newConn = func() (sessionConn, error) {
-			return newSessionConn(httpClient, writeTimeout), nil
+			return newSessionConn(httpClient, writeTimeout, closeTimeout), nil
 		}
 	}
 
@@ -205,8 +205,8 @@ type EvtClient struct {
 	current           *session
 	identSess         *session // current session waiting for its identify turn
 	identReq          *identifyRequest
-	dialing           chan struct{} // closed when the outstanding Open returned; nil if none
-	dialRun           *run
+	abandonedDials    int           // Opens given up on that have not returned yet
+	dialReturned      chan struct{} // closed (and replaced) whenever an abandoned Open returns
 	sessionID         string
 	resumeURL         string
 	resumeURLFailures int

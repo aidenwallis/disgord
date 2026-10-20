@@ -15,6 +15,7 @@ import (
 )
 
 var errConnNotOpen = errors.New("websocket connection is not open")
+var errCloseTimedOut = errors.New("websocket close handshake timed out, connection force-closed")
 
 // newConn creates the long-lived wrapper used by the (legacy) voice client.
 func newConn(httpClient *http.Client) (Conn, error) {
@@ -24,11 +25,13 @@ func newConn(httpClient *http.Client) (Conn, error) {
 }
 
 // newSessionConn creates the wrapper for one event client session. Every write is bounded by writeTimeout,
-// which also works around writes that can otherwise hang forever in nhooyr v1.8.7 (#405).
-func newSessionConn(httpClient *http.Client, writeTimeout time.Duration) sessionConn {
+// which also works around writes that can otherwise hang forever in nhooyr v1.8.7 (#405), and the close
+// handshake is bounded by closeTimeout.
+func newSessionConn(httpClient *http.Client, writeTimeout, closeTimeout time.Duration) sessionConn {
 	return &nhooyr{
 		httpClient:   httpClient,
 		writeTimeout: writeTimeout,
+		closeTimeout: closeTimeout,
 	}
 }
 
@@ -37,6 +40,7 @@ type nhooyr struct {
 	c            *websocket.Conn
 	httpClient   *http.Client
 	writeTimeout time.Duration
+	closeTimeout time.Duration // 0: unbounded (legacy voice behaviour)
 	isConnected  atomic.Bool
 }
 
@@ -91,6 +95,12 @@ func (g *nhooyr) Close() (err error) {
 	return g.closeWith(websocket.StatusNormalClosure, "Bot is shutting down")
 }
 
+// CloseWithStatus performs the close handshake, bounded by closeTimeout.
+//
+// Known limitation of nhooyr v1.8.7: if Close takes the read lock before our receiver does, it consumes the peer's
+// close frame itself and the peer's close code is lost (later reads report our own code, which is ignored as an
+// echo). A fatal code sent at that moment therefore costs one extra connection attempt; the next connection
+// receives it through the receiver and the shard stops.
 func (g *nhooyr) CloseWithStatus(code int, reason string) error {
 	return g.closeWith(websocket.StatusCode(code), reason)
 }
@@ -102,12 +112,48 @@ func (g *nhooyr) closeWith(code websocket.StatusCode, reason string) (err error)
 		return nil
 	}
 
-	err = c.Close(code, reason)
+	if g.closeTimeout <= 0 {
+		err = c.Close(code, reason)
+	} else {
+		err = closeBounded(c, code, reason, g.closeTimeout)
+	}
 	if !g.isConnected.Load() {
 		err = nil // discard error if we're already closed, should be a noop anyways
 	}
 	g.isConnected.Store(false)
 	return err
+}
+
+// closeBounded runs nhooyr's close handshake with an absolute deadline. nhooyr bounds the handshake by 5s+5s,
+// except when it discards the payload of a partially received frame: that read has no deadline and a stalled
+// peer blocks it forever.
+func closeBounded(c *websocket.Conn, code websocket.StatusCode, reason string, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Close(code, reason)
+	}()
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+	}
+
+	// A Read with an already cancelled context force-closes the connection: while Close holds the read lock the
+	// lock attempt takes its ctx.Done branch, which closes the underlying net.Conn and unblocks the handshake.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _ = c.Read(ctx)
+
+	grace := time.NewTimer(time.Second)
+	defer grace.Stop()
+	select {
+	case <-done:
+	case <-grace.C:
+	}
+	return errCloseTimedOut
 }
 
 func (g *nhooyr) Read(ctx context.Context) (packet []byte, err error) {

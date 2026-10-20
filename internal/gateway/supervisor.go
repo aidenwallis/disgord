@@ -26,6 +26,7 @@ type timeouts struct {
 	dial             time.Duration
 	hello            time.Duration
 	write            time.Duration
+	closeHandshake   time.Duration // absolute bound for the websocket close handshake
 	readyIdle        time.Duration // readable time without a dispatch frame while waiting for READY/RESUMED
 	readyCeiling     time.Duration // readable time from IDENTIFY to READY
 	teardownJoinWarn time.Duration // error log cadence while waiting for session workers to retire
@@ -46,6 +47,7 @@ func defaultTimeouts() timeouts {
 		dial:              30 * time.Second,
 		hello:             20 * time.Second,
 		write:             10 * time.Second,
+		closeHandshake:    10 * time.Second,
 		readyIdle:         60 * time.Second,
 		readyCeiling:      10 * time.Minute,
 		teardownJoinWarn:  15 * time.Second,
@@ -70,6 +72,7 @@ func (t timeouts) withDefaults() timeouts {
 	fill(&t.dial, d.dial)
 	fill(&t.hello, d.hello)
 	fill(&t.write, d.write)
+	fill(&t.closeHandshake, d.closeHandshake)
 	fill(&t.readyIdle, d.readyIdle)
 	fill(&t.readyCeiling, d.readyCeiling)
 	fill(&t.teardownJoinWarn, d.teardownJoinWarn)
@@ -167,6 +170,7 @@ type run struct {
 	first     chan error
 	firstSent bool // supervisor goroutine only
 	done      chan struct{}
+	terminal  error // why the run ended; written before done is closed
 
 	stopping bool // guarded by EvtClient.lifecycleMu
 }
@@ -176,6 +180,11 @@ func (r *run) sendFirst(err error) {
 		r.firstSent = true
 		r.first <- err
 	}
+}
+
+// terminalErr is only valid once done is closed.
+func (r *run) terminalErr() error {
+	return r.terminal
 }
 
 func (r *run) waitFirst() error {
@@ -308,6 +317,7 @@ func (c *EvtClient) supervise(r *run) {
 			err := newCloseError(out.reason.code)
 			c.log.Error(c.getLogPrefix(), "shard stopped permanently:", err)
 			c.setState(stateStopped, fmt.Sprintf("close code %d", out.reason.code))
+			r.terminal = err
 			r.sendFirst(err)
 			return
 		}
@@ -345,10 +355,10 @@ func (c *EvtClient) supervise(r *run) {
 }
 
 // retire runs when the supervisor exits. The run is only marked done once nothing it started can still touch
-// the shard: workers are already joined by teardown, and an abandoned dial must have returned.
+// the shard state: workers are already joined by teardown. Abandoned dials may outlive the run; they only own
+// (and close) their unpublished connection.
 func (c *EvtClient) retire(r *run) {
 	c.detachIdentify(r)
-	c.awaitDialRetired(r, nil)
 	r.cancel()
 
 	c.lifecycleMu.Lock()
@@ -357,6 +367,9 @@ func (c *EvtClient) retire(r *run) {
 	}
 	c.lifecycleMu.Unlock()
 
+	if r.terminal == nil {
+		r.terminal = ErrDisconnected
+	}
 	r.sendFirst(ErrDisconnected)
 	close(r.done)
 }
@@ -438,7 +451,7 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 		out.reason = stopFailure
 		return out
 	}
-	if !c.awaitDialRetired(r, r.ctx.Done()) {
+	if !c.awaitDialSlot(r) {
 		out.reason = stopFailure
 		return out
 	}
@@ -532,7 +545,7 @@ func (c *EvtClient) establish(r *run, sess *session, resumable, viaResumeURL boo
 			CmdName: event.Resume,
 		}
 		c.mu.Unlock()
-		err = sess.writeControl(pkt)
+		err = sess.writeControl(pkt, c.to.write)
 	} else {
 		out.phase = phaseIdentify
 		c.setState(stateIdentifying, "")
@@ -541,7 +554,8 @@ func (c *EvtClient) establish(r *run, sess *session, resumable, viaResumeURL boo
 	if err != nil {
 		if r.ctx.Err() != nil {
 			sess.fail(stopFailure)
-		} else if !errors.Is(err, errWriteNotAccepted) {
+		} else {
+			// a no-op if the session already failed (e.g. the write error was recorded by the writer)
 			sess.fail(failReason{kind: failTransport, err: err})
 		}
 		return out
@@ -673,8 +687,12 @@ func (c *EvtClient) joinWorkers(sess *session) {
 }
 
 // ---------------------------------------------------------------------------
-// dialing: at most one outstanding Open per shard, across attempts and runs
+// dialing
 // ---------------------------------------------------------------------------
+
+// maxAbandonedDials caps the Opens a shard gives up on that are still running, e.g. dials through a legacy proxy
+// that ignores its context. New attempts only wait once the cap is reached.
+const maxAbandonedDials = 4
 
 // dial opens a fresh connection. The helper goroutine owns the connection until it is handed over; if the
 // attempt gives up first, the helper closes a late connection itself and it is never published.
@@ -687,24 +705,10 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, c.to.dial)
 	defer cancel()
 
-	retired := make(chan struct{})
-	c.mu.Lock()
-	c.dialing, c.dialRun = retired, r
-	c.mu.Unlock()
-
 	var mu sync.Mutex
 	var abandoned, delivered bool
 	result := make(chan error, 1)
 	go func() {
-		defer func() {
-			c.mu.Lock()
-			if c.dialing == retired {
-				c.dialing, c.dialRun = nil, nil
-			}
-			c.mu.Unlock()
-			close(retired)
-		}()
-
 		err := conn.Open(ctx, endpoint, nil)
 
 		mu.Lock()
@@ -713,6 +717,13 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 			if err == nil {
 				_ = conn.CloseWithStatus(1000, "connection attempt abandoned")
 			}
+			c.mu.Lock()
+			c.abandonedDials--
+			if c.dialReturned != nil {
+				close(c.dialReturned)
+				c.dialReturned = nil
+			}
+			c.mu.Unlock()
 			return
 		}
 		delivered = true
@@ -726,6 +737,9 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 		mu.Lock()
 		if !delivered {
 			abandoned = true
+			c.mu.Lock()
+			c.abandonedDials++
+			c.mu.Unlock()
 			mu.Unlock()
 			if r.ctx.Err() != nil {
 				return nil, ErrDisconnected
@@ -741,24 +755,38 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 	return conn, nil
 }
 
-// awaitDialRetired waits until no Open is outstanding. With cancel == nil it only waits for an Open started by
-// r, logging while it does (used when a run retires).
-func (c *EvtClient) awaitDialRetired(r *run, cancel <-chan struct{}) bool {
-	warn := time.NewTicker(c.to.teardownJoinWarn)
-	defer warn.Stop()
+// awaitDialSlot waits, cancellable by the run, while maxAbandonedDials Opens are still outstanding.
+func (c *EvtClient) awaitDialSlot(r *run) bool {
+	var warn *time.Ticker
+	defer func() {
+		if warn != nil {
+			warn.Stop()
+		}
+	}()
 	for {
 		c.mu.Lock()
-		retired, owner := c.dialing, c.dialRun
-		c.mu.Unlock()
-		if retired == nil || (cancel == nil && owner != r) {
+		if c.abandonedDials < maxAbandonedDials {
+			c.mu.Unlock()
 			return true
 		}
+		if c.dialReturned == nil {
+			c.dialReturned = make(chan struct{})
+		}
+		returned := c.dialReturned
+		c.mu.Unlock()
+
+		var warnC <-chan time.Time
+		if warn == nil {
+			c.log.Error(c.getLogPrefix(), maxAbandonedDials, "websocket dials ignored their timeout and are still running; waiting before dialing again")
+			warn = time.NewTicker(c.to.teardownJoinWarn)
+		}
+		warnC = warn.C
 		select {
-		case <-retired:
-		case <-cancel:
+		case <-returned:
+		case <-r.ctx.Done():
 			return false
-		case <-warn.C:
-			c.log.Error(c.getLogPrefix(), "waiting for an abandoned websocket dial to return")
+		case <-warnC:
+			c.log.Error(c.getLogPrefix(), "still waiting for abandoned websocket dials to return")
 		}
 	}
 }
@@ -834,19 +862,21 @@ func (q *identifyRequest) wasInvoked() bool {
 }
 
 // requestIdentify registers sess as waiting for IDENTIFY and attaches r to the outstanding request, creating
-// one lazily.
-func (c *EvtClient) requestIdentify(r *run, sess *session) *identifyRequest {
+// one lazily. The slot stays owned until the queue call returned: when the outstanding request can not be
+// attached (its turn already ran, but a custom queue has not returned yet) it is returned with attached=false
+// and the caller must wait for it before asking again.
+func (c *EvtClient) requestIdentify(r *run, sess *session) (q *identifyRequest, attached bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.identSess = sess
-	if q := c.identReq; q != nil && q.attach(r) {
-		return q
+	if q = c.identReq; q != nil {
+		return q, q.attach(r)
 	}
 
-	q := &identifyRequest{run: r, done: make(chan struct{})}
+	q = &identifyRequest{run: r, done: make(chan struct{})}
 	c.identReq = q
 	go c.runIdentifyRequest(q)
-	return q
+	return q, true
 }
 
 func (c *EvtClient) runIdentifyRequest(q *identifyRequest) {
@@ -913,7 +943,7 @@ func (c *EvtClient) identifyTurn(q *identifyRequest) error {
 
 	c.mu.Lock()
 	sess := c.identSess
-	if sess == nil || sess.run != r || c.current != sess || sess.isFailed() {
+	if sess == nil || sess.run != r || c.current != sess || sess.isFailed() || r.ctx.Err() != nil {
 		c.mu.Unlock()
 		return errIdentifyNotSent
 	}
@@ -924,7 +954,7 @@ func (c *EvtClient) identifyTurn(q *identifyRequest) error {
 	c.seq, c.hasSeq = 0, false
 	c.mu.Unlock()
 
-	err := sess.writeControl(c.identifyPacket())
+	err := sess.writeControl(c.identifyPacket(), c.to.write)
 	if errors.Is(err, errWriteNotAccepted) {
 		return errIdentifyNotSent
 	}
@@ -941,8 +971,8 @@ func (c *EvtClient) identifyPacket() *clientPacket {
 
 // awaitIdentify waits for this shard's identify turn to write IDENTIFY on sess.
 func (c *EvtClient) awaitIdentify(r *run, sess *session) error {
-	for regrants := 0; ; regrants++ {
-		q := c.requestIdentify(r, sess)
+	for regrants := 0; ; {
+		q, attached := c.requestIdentify(r, sess)
 		select {
 		case <-sess.identified:
 			return sess.identifyErr
@@ -958,7 +988,11 @@ func (c *EvtClient) awaitIdentify(r *run, sess *session) error {
 			return sess.identifyErr
 		default:
 		}
-		if !q.wasInvoked() || (q.err != nil && !errors.Is(q.err, errIdentifyNotSent)) || regrants >= 3 {
+		if !attached {
+			// a previous request finally returned; its result belongs to another session
+			continue
+		}
+		if regrants++; !q.wasInvoked() || (q.err != nil && !errors.Is(q.err, errIdentifyNotSent)) || regrants > 3 {
 			if q.err == nil {
 				return errors.New("identify queue returned without granting a turn")
 			}

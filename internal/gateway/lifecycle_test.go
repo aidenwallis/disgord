@@ -294,56 +294,101 @@ func TestLifecycle34_FirstBeforeDone(t *testing.T) {
 }
 
 // 31: Connect while the previous run is still stopping returns ErrStopping, never a second supervisor.
-// 46: Disconnect during a dial that ignores its ctx returns within the disconnect timeout; there is never more
-// than one outstanding dial; a late connection is closed and never used.
-func TestLifecycle46_StalledDialIgnoringCtx(t *testing.T) {
+func TestLifecycle31_ConnectWhileStopping(t *testing.T) {
 	to := fastTimeouts()
-	to.dial = 50 * time.Millisecond
-	to.disconnect = 300 * time.Millisecond
-	block := make(chan struct{})
+	to.disconnect = 100 * time.Millisecond
 	ss := newScriptShard(t, to, func(sc *scriptConn) {
 		if sc.id == 0 {
-			sc.openBlock = block
+			sc.readDelayAfterClose = time.Second // the old session retires slowly
 		}
 	}, nil)
+	connectScripted(t, ss, 45000)
 
-	connected := ss.connectAsync()
-	first := ss.d.await(t)
-	time.Sleep(20 * to.dial) // many dial timeouts elapse
-	if n := ss.d.count(); n != 1 {
-		t.Fatalf("expected at most one outstanding dial, got %d connection attempts", n)
-	}
-
-	start := time.Now()
 	if err := ss.c.Disconnect(); !errors.Is(err, ErrDisconnectTimeout) {
-		t.Fatalf("expected ErrDisconnectTimeout while the dial is stuck, got %v", err)
-	}
-	if d := time.Since(start); d > 10*to.disconnect {
-		t.Fatalf("Disconnect took %s", d)
+		t.Fatalf("expected ErrDisconnectTimeout while the session retires, got %v", err)
 	}
 	if err := ss.c.Connect(); !errors.Is(err, ErrStopping) {
 		t.Fatalf("expected ErrStopping while the previous run retires, got %v", err)
 	}
+	if !waitFor(10*time.Second, func() bool {
+		ss.c.lifecycleMu.Lock()
+		defer ss.c.lifecycleMu.Unlock()
+		return ss.c.run == nil
+	}) {
+		t.Fatal("the run never retired")
+	}
+	connected := ss.connectAsync()
+	sc := ss.d.await(t)
+	sc.hello(45000)
+	waitOp(t, sc, 6, 1) // a shard-level Disconnect keeps the session (the shard manager resets it)
+	sc.dispatch(2, "RESUMED", `{}`)
+	if err := awaitErr(t, connected); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	close(block) // the dial completes late
+// 46: dials that ignore their ctx (legacy proxies) never wedge the shard: at most maxAbandonedDials are left
+// running, Disconnect returns promptly, a later Connect works once a slot frees up, and late connections are
+// closed without ever being used.
+func TestLifecycle46_StalledDialsIgnoringCtx(t *testing.T) {
+	to := fastTimeouts()
+	to.dial = 50 * time.Millisecond
+	to.disconnect = 2 * time.Second
+	block := make(chan struct{})
+	var live, maxLive atomic.Int32
+	ss := newScriptShard(t, to, func(sc *scriptConn) {
+		sc.openBlock = block
+		sc.live, sc.maxLive = &live, &maxLive
+	}, nil)
+
+	connected := ss.connectAsync()
+	if !waitFor(10*time.Second, func() bool { return ss.d.count() == maxAbandonedDials }) {
+		t.Fatalf("expected the shard to keep attempting up to %d stuck dials, got %d", maxAbandonedDials, ss.d.count())
+	}
+	time.Sleep(20 * to.dial) // many more dial timeouts elapse
+	if n := ss.d.count(); n != maxAbandonedDials {
+		t.Fatalf("expected at most %d outstanding dials, got %d connection attempts", maxAbandonedDials, n)
+	}
+
+	start := time.Now()
+	if err := ss.c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect must not wait for abandoned dials: %v", err)
+	}
+	if d := time.Since(start); d > to.disconnect {
+		t.Fatalf("Disconnect took %s", d)
+	}
 	if err := awaitErr(t, connected); !errors.Is(err, ErrDisconnected) {
 		t.Fatalf("expected ErrDisconnected, got %v", err)
 	}
-	if !waitFor(5*time.Second, func() bool { return first.Disconnected() }) {
-		t.Fatal("a late connection must be closed")
-	}
-	if len(first.writes()) != 0 {
-		t.Fatal("a late connection must never be used")
-	}
 
-	// the shard can be connected again once the run retired
+	// a new run waits for a free dial slot instead of piling up more stuck dials
 	connected = ss.connectAsync()
+	time.Sleep(10 * to.dial)
+	if n := ss.d.count(); n != maxAbandonedDials {
+		t.Fatalf("a new run must wait for a free dial slot, got %d connection attempts", n)
+	}
+	var stuck []*scriptConn
+	for i := 0; i < maxAbandonedDials; i++ {
+		stuck = append(stuck, ss.d.await(t))
+	}
+	close(block) // the stuck dials complete late
 	sc := ss.d.await(t)
 	sc.hello(45000)
 	waitOp(t, sc, 2, 1)
 	sc.ready("sess-2")
 	if err := awaitErr(t, connected); err != nil {
 		t.Fatal(err)
+	}
+	for _, late := range stuck {
+		if !waitFor(5*time.Second, late.Disconnected) {
+			t.Fatalf("late connection %d was not closed", late.id)
+		}
+		if len(late.writes()) != 0 {
+			t.Fatalf("late connection %d was used", late.id)
+		}
+	}
+	if n := maxLive.Load(); n > maxAbandonedDials {
+		t.Fatalf("%d dials were running at once, the cap is %d", n, maxAbandonedDials)
 	}
 }
 
@@ -537,99 +582,253 @@ func TestLifecycle44_CyclesWhileAdmissionBlocked(t *testing.T) {
 	})
 }
 
-// 38/45: saturated user traffic (and op 1 spam) never exceeds the outbound limit, and the scheduled heartbeat
-// cadence is kept.
-func TestLifecycle38_OutboundBudget(t *testing.T) {
+// recordFrames records every frame written on scripted connections, per connection.
+type frameRecorder struct {
+	mu     sync.Mutex
+	frames map[int][]frameRecord
+}
+
+func (r *frameRecorder) record(sc *scriptConn, p *clientPacket) {
+	r.mu.Lock()
+	if r.frames == nil {
+		r.frames = map[int][]frameRecord{}
+	}
+	r.frames[sc.id] = append(r.frames[sc.id], frameRecord{at: time.Now(), op: int(p.Op)})
+	r.mu.Unlock()
+}
+
+func (r *frameRecorder) of(id int) []frameRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]frameRecord(nil), r.frames[id]...)
+}
+
+// saturate keeps the command queue full (bypassing the enqueue-time limiter) until stop is closed.
+func saturate(c *EvtClient, stop chan struct{}, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := c.messageQueue.Add(&clientPacket{Op: opcode.EventRequestGuildMembers, Data: 1, CmdName: "REQUEST_GUILD_MEMBERS"}); err == nil {
+				c.signalCommands()
+			} else {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+}
+
+// 45 (and 38 without op 1): a short heartbeat interval with saturated user traffic never exceeds the outbound
+// limit and keeps the scheduled heartbeat cadence.
+func TestLifecycle45_ShortIntervalSaturated(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	to := fastTimeouts()
+	to.outboundWindow = 2 * time.Second
+	to.outboundLimit = 120
+
+	var rec frameRecorder
+	ss := newScriptShard(t, to, func(sc *scriptConn) {
+		sc.onWrite = func(sc *scriptConn, p *clientPacket) error {
+			rec.record(sc, p)
+			return ackHeartbeats(sc, p)
+		}
+	}, nil)
+	connectScripted(t, ss, int(interval/time.Millisecond))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	saturate(ss.c, stop, &wg)
+	time.Sleep(3 * to.outboundWindow)
+	close(stop)
+	wg.Wait()
+
+	if n := ss.d.count(); n != 1 {
+		t.Fatalf("saturation caused a reconnect (%d connections)", n)
+	}
+	frames := rec.of(0)
+	assertOutboundBudget(t, frames, to.outboundWindow, to.outboundLimit)
+
+	var last time.Time
+	var maxGap time.Duration
+	var commands int
+	for _, f := range frames {
+		if f.op == int(opcode.EventRequestGuildMembers) {
+			commands++
+		}
+		if f.op != int(opcode.EventHeartbeat) {
+			continue
+		}
+		if !last.IsZero() && f.at.Sub(last) > maxGap {
+			maxGap = f.at.Sub(last)
+		}
+		last = f.at
+	}
+	if maxGap > interval+interval/2 {
+		t.Fatalf("max heartbeat gap %s exceeds interval %s + slack", maxGap, interval)
+	}
+	if commands < 100 {
+		t.Fatalf("expected the user budget to be used, only %d commands sent", commands)
+	}
+}
+
+// 38: saturated user traffic plus op 1 spam: the outbound limit is never exceeded on any connection, and op 1
+// requests are answered or, once the hard limit is exhausted, the session reconnects (never silently ignored).
+func TestLifecycle38_Op1SpamRespondsOrReconnects(t *testing.T) {
+	const interval = 100 * time.Millisecond
+	to := fastTimeouts()
+	to.outboundWindow = 2 * time.Second
+	to.outboundLimit = 120
+
+	var rec frameRecorder
+	ss := newScriptShard(t, to, func(sc *scriptConn) {
+		sc.onWrite = func(sc *scriptConn, p *clientPacket) error {
+			rec.record(sc, p)
+			if p.Op == opcode.EventResume {
+				sc.dispatch(2, "RESUMED", `{}`)
+			}
+			return ackHeartbeats(sc, p)
+		}
+		if sc.id > 0 {
+			sc.hello(int(interval / time.Millisecond))
+		}
+	}, nil)
+	sc := connectScripted(t, ss, int(interval/time.Millisecond))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	saturate(ss.c, stop, &wg)
+	var requests atomic.Int32
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-sc.closed:
+				return
+			case <-tick.C:
+				requests.Inc()
+				sc.send(map[string]interface{}{"op": 1})
+			}
+		}
+	}()
+	time.Sleep(3 * to.outboundWindow)
+	close(stop)
+	wg.Wait()
+
+	for id := 0; id < ss.d.count(); id++ {
+		assertOutboundBudget(t, rec.of(id), to.outboundWindow, to.outboundLimit)
+	}
+	reconnected := ss.d.count() > 1
+	exhausted := ss.log.Count("a requested heartbeat can not be answered") > 0
+	var beats int
+	for _, f := range rec.of(0) {
+		if f.op == int(opcode.EventHeartbeat) {
+			beats++
+		}
+	}
+	switch {
+	case reconnected && !exhausted:
+		t.Fatalf("unexpected reconnect:\n%s", ss.log.Tail(20))
+	case !reconnected && beats < int(requests.Load())/10:
+		t.Fatalf("op 1 requests were not answered: %d requests, %d heartbeats", requests.Load(), beats)
+	}
+	t.Logf("op 1 requests=%d heartbeats on the first connection=%d reconnected=%v", requests.Load(), beats, reconnected)
+}
+
+// Item 7 of the review: an op 1 request is answered within the hard limit even when the control share is used up,
+// and reconnects (outboundExhausted) only when the hard limit is exhausted.
+func TestHeartbeatRequestUsesHardLimit(t *testing.T) {
+	newSession := func() (*session, *scriptConn) {
+		c := &EvtClient{log: newTestLogger("op1"), to: defaultTimeouts()}
+		s := c.newSession(nil)
+		sc := newScriptConn(0)
+		s.conn = sc
+		s.interval.Store(int64(time.Second))
+		return s, sc
+	}
+	fill := func(n int) *outboundBudget {
+		b := &outboundBudget{window: time.Minute}
+		for i := 0; i < n; i++ {
+			b.record(time.Now())
+		}
+		return b
+	}
+	_, control := outboundLimits(time.Second, time.Minute, 120)
+
+	s, sc := newSession()
+	if !s.sendHeartbeat(fill(control), false) || sc.countOp(1) != 1 {
+		t.Fatal("an op 1 request above the control share must still be answered")
+	}
+
+	s, sc = newSession()
+	if s.sendHeartbeat(fill(120), false) || sc.countOp(1) != 0 {
+		t.Fatal("an op 1 request at the hard limit must not be written")
+	}
+	if r := s.freeze(); r.kind != failOutboundExhausted {
+		t.Fatalf("expected the session to fail with outboundExhausted, got %s", r)
+	}
+}
+
+// Review item 6: READY/RESUMED end the handshake even if their sequence number is missing or not ahead of ours.
+func TestResumedWithStaleOrMissingSeq(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		interval time.Duration
-		op1Spam  bool
+		name    string
+		resumed string
 	}{
-		{"saturated+op1-spam", 100 * time.Millisecond, true},
-		{"short-interval", 200 * time.Millisecond, false},
+		{"seq-equal", `{"op":0,"t":"RESUMED","s":3,"d":{}}`},
+		{"seq-missing", `{"op":0,"t":"RESUMED","d":{}}`},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			to := fastTimeouts()
-			to.outboundWindow = 2 * time.Second
-			to.outboundLimit = 120
-
-			var mu sync.Mutex
-			var frames []frameRecord
-			ss := newScriptShard(t, to, func(sc *scriptConn) {
-				sc.onWrite = func(sc *scriptConn, p *clientPacket) error {
-					mu.Lock()
-					frames = append(frames, frameRecord{at: time.Now(), op: int(p.Op)})
-					mu.Unlock()
-					return ackHeartbeats(sc, p)
-				}
-			}, nil)
-			sc := connectScripted(t, ss, int(tc.interval/time.Millisecond))
-
-			stop := make(chan struct{})
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() { // keep the command queue full, bypassing the enqueue-time limiter
-				defer wg.Done()
-				for {
-					select {
-					case <-stop:
-						return
-					default:
-					}
-					if err := ss.c.messageQueue.Add(&clientPacket{Op: opcode.EventRequestGuildMembers, Data: 1, CmdName: "REQUEST_GUILD_MEMBERS"}); err == nil {
-						ss.c.signalCommands()
-					} else {
-						time.Sleep(time.Millisecond)
-					}
-				}
-			}()
-			if tc.op1Spam {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for {
-						select {
-						case <-stop:
-							return
-						case <-time.After(5 * time.Millisecond):
-							sc.send(map[string]interface{}{"op": 1})
-						}
-					}
-				}()
+			to.readyIdle = 200 * time.Millisecond
+			ss := newScriptShard(t, to, nil, nil)
+			sc := connectScripted(t, ss, 45000)
+			sc.dispatch(2, "MESSAGE_CREATE", `{}`)
+			sc.dispatch(3, "MESSAGE_CREATE", `{}`)
+			if !waitFor(5*time.Second, func() bool { return len(ss.events) == 3 }) {
+				t.Fatal("events not delivered")
 			}
-			time.Sleep(3 * to.outboundWindow)
-			close(stop)
-			wg.Wait()
 
-			if n := ss.d.count(); n != 1 {
-				t.Fatalf("saturation caused a reconnect (%d connections)", n)
+			sc.send(map[string]interface{}{"op": 7, "d": nil})
+			sc2 := ss.d.await(t)
+			sc2.hello(45000)
+			waitOp(t, sc2, 6, 1)
+			sc2.inbox <- []byte(tc.resumed)
+			if !waitFor(5*time.Second, func() bool { return ss.c.stateSnapshot() == "ready" }) {
+				t.Fatalf("RESUMED did not complete the handshake, state %q", ss.c.stateSnapshot())
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			assertOutboundBudget(t, frames, to.outboundWindow, to.outboundLimit)
-
-			var last time.Time
-			var maxGap time.Duration
-			var commands int
-			for _, f := range frames {
-				if f.op == int(opcode.EventRequestGuildMembers) {
-					commands++
-				}
-				if f.op != int(opcode.EventHeartbeat) {
-					continue
-				}
-				if !last.IsZero() && f.at.Sub(last) > maxGap {
-					maxGap = f.at.Sub(last)
-				}
-				last = f.at
+			time.Sleep(5 * to.readyIdle)
+			if n := ss.d.count(); n != 2 {
+				t.Fatalf("the RESUME was retried (%d connections)", n)
 			}
-			if maxGap > tc.interval+tc.interval/2 {
-				t.Fatalf("max heartbeat gap %s exceeds interval %s + slack", maxGap, tc.interval)
-			}
-			if commands < 100 {
-				t.Fatalf("expected the user budget to be used, only %d commands sent", commands)
+			ss.c.mu.Lock()
+			seq := ss.c.seq
+			ss.c.mu.Unlock()
+			if seq != 3 {
+				t.Fatalf("expected the checkpoint to stay at 3, got %d", seq)
 			}
 		})
 	}
+
+	t.Run("ready-seq-missing", func(t *testing.T) {
+		ss := newScriptShard(t, nil, nil, nil)
+		connected := ss.connectAsync()
+		sc := ss.d.await(t)
+		sc.hello(45000)
+		waitOp(t, sc, 2, 1)
+		sc.inbox <- []byte(`{"op":0,"t":"READY","d":{"session_id":"sess-1"}}`)
+		if err := awaitErr(t, connected); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

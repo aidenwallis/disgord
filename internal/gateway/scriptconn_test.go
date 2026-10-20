@@ -35,6 +35,8 @@ type scriptConn struct {
 	// openBlock, when set, makes Open ignore its ctx and block until closed (legacy proxy dial).
 	openBlock chan struct{}
 	openCalls atomic.Int32
+	// live/maxLive, when set, count Opens in progress across connections
+	live, maxLive *atomic.Int32
 
 	mu        sync.Mutex
 	written   []*clientPacket
@@ -56,6 +58,12 @@ func newScriptConn(id int) *scriptConn {
 
 func (sc *scriptConn) Open(ctx context.Context, endpoint string, requestHeader http.Header) error {
 	sc.openCalls.Inc()
+	if sc.live != nil {
+		n := sc.live.Inc()
+		defer sc.live.Dec()
+		for m := sc.maxLive.Load(); n > m && !sc.maxLive.CAS(m, n); m = sc.maxLive.Load() {
+		}
+	}
 	if sc.openBlock != nil {
 		<-sc.openBlock
 	}
@@ -157,7 +165,10 @@ func (sc *scriptConn) send(v interface{}) {
 	if err != nil {
 		panic(err)
 	}
-	sc.inbox <- b
+	select {
+	case sc.inbox <- b:
+	case <-sc.closed: // nobody reads a closed connection anymore
+	}
 }
 
 func (sc *scriptConn) hello(intervalMs int) {
@@ -186,7 +197,7 @@ type scriptDialer struct {
 }
 
 func newScriptDialer(setup func(sc *scriptConn)) *scriptDialer {
-	return &scriptDialer{setup: setup, next: make(chan *scriptConn, 100)}
+	return &scriptDialer{setup: setup, next: make(chan *scriptConn, 1000)}
 }
 
 func (d *scriptDialer) newConn() (sessionConn, error) {
@@ -197,7 +208,10 @@ func (d *scriptDialer) newConn() (sessionConn, error) {
 	if d.setup != nil {
 		d.setup(sc)
 	}
-	d.next <- sc
+	select {
+	case d.next <- sc:
+	default: // a test that does not await connections must not block the shard
+	}
 	return sc, nil
 }
 

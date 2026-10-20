@@ -408,7 +408,7 @@ func (s *shardMngr) awaitStartup(m *mrun) error {
 		case res := <-results:
 			switch {
 			case res.terminated:
-				return fmt.Errorf("shard %d stopped while other shards were starting", res.id)
+				return stoppedDuringStartup(res.id, m.runs[res.id])
 			case res.err != nil:
 				return fmt.Errorf("shard %d: %w", res.id, res.err)
 			}
@@ -417,7 +417,26 @@ func (s *shardMngr) awaitStartup(m *mrun) error {
 			return ErrDisconnected
 		}
 	}
+
+	// READY and termination arrive as separate results; a shard may already have retired although its READY was
+	// counted last. done is closed after the terminal error is written, so this check is authoritative.
+	for id, r := range m.runs {
+		select {
+		case <-r.done:
+			return stoppedDuringStartup(id, r)
+		default:
+		}
+	}
+	select {
+	case <-m.stopping:
+		return ErrDisconnected
+	default:
+	}
 	return nil
+}
+
+func stoppedDuringStartup(id shardID, r *run) error {
+	return fmt.Errorf("shard %d stopped while other shards were starting: %w", id, r.terminalErr())
 }
 
 // stop initiates the retirement of every run started by m (never "whatever run a shard has now"). It does not

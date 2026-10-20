@@ -367,7 +367,10 @@ func (s *session) onDispatch(p *DiscordPacket, now time.Time) {
 	hasSeq, seq := c.hasSeq, c.seq
 	c.mu.Unlock()
 
-	if hasSeq && p.SequenceNumber <= seq {
+	// READY/RESUMED end the handshake even if their sequence number is missing or not ahead of ours; dropping
+	// them as duplicates would make every RESUME time out.
+	handshake := p.EventName == event.Ready || p.EventName == event.Resumed
+	if !handshake && hasSeq && p.SequenceNumber <= seq {
 		c.log.Debug(s.prefix(), "dropping duplicate event", p.EventName, "seq", p.SequenceNumber, "<=", seq)
 		return
 	}
@@ -394,8 +397,10 @@ func (s *session) onDispatch(p *DiscordPacket, now time.Time) {
 	// only advance the resume checkpoint once the event was handed over
 	c.mu.Lock()
 	if c.current == s {
-		c.seq = p.SequenceNumber
-		c.hasSeq = true
+		if p.SequenceNumber > 0 && (!c.hasSeq || p.SequenceNumber > c.seq) {
+			c.seq = p.SequenceNumber
+			c.hasSeq = true
+		}
 		if ready != nil {
 			c.sessionID = ready.SessionID
 			c.resumeURL = ready.ResumeGatewayURL
@@ -405,7 +410,7 @@ func (s *session) onDispatch(p *DiscordPacket, now time.Time) {
 	}
 	c.mu.Unlock()
 
-	if p.EventName == event.Ready || p.EventName == event.Resumed {
+	if handshake {
 		s.markReady()
 	}
 }
@@ -698,8 +703,9 @@ func (s *session) writeFrame(budget *outboundBudget, pkt *clientPacket) error {
 	return s.conn.WriteJSON(pkt)
 }
 
-// sendHeartbeat writes a heartbeat. Scheduled heartbeats may use the whole budget; heartbeats requested by
-// Discord (op 1) only the control share, so they can never crowd out the scheduled ones.
+// sendHeartbeat writes a heartbeat. Heartbeats may use the whole budget. A scheduled heartbeat waits for budget
+// if that still meets its deadline; a heartbeat requested by Discord (op 1) is never silently ignored: if the hard
+// cap is exhausted the session is reconnected instead.
 func (s *session) sendHeartbeat(budget *outboundBudget, scheduled bool) bool {
 	c := s.c
 	interval := time.Duration(s.interval.Load())
@@ -725,12 +731,10 @@ func (s *session) sendHeartbeat(budget *outboundBudget, scheduled bool) bool {
 				return false
 			}
 		}
-	} else {
-		_, controlLimit := outboundLimits(interval, budget.window, hardCap)
-		if budget.used(now) >= controlLimit {
-			c.log.Debug(s.prefix(), "not answering heartbeat request: outbound budget is reserved for scheduled heartbeats")
-			return true
-		}
+	} else if budget.used(now) >= hardCap {
+		c.log.Error(s.prefix(), "outbound rate limit exhausted, a requested heartbeat can not be answered; reconnecting")
+		s.fail(failReason{kind: failOutboundExhausted})
+		return false
 	}
 
 	pkt := &clientPacket{Op: opcode.EventHeartbeat, Data: c.heartbeatSeq(), CmdName: event.Heartbeat}
@@ -768,13 +772,19 @@ func (s *session) sendCommand(budget *outboundBudget) bool {
 }
 
 // writeControl hands a control frame to the writer and waits for the write to complete. errWriteNotAccepted
-// means the frame was definitely not written.
-func (s *session) writeControl(pkt *clientPacket) error {
+// means the frame was definitely not written and never will be: writeCh is unbuffered, so the hand-over either
+// happens (the writer then always writes and answers, bounded by its per-write deadline) or it does not happen
+// at all. Acceptance itself is bounded too, e.g. while the outbound budget holds control frames back.
+func (s *session) writeControl(pkt *clientPacket, acceptWithin time.Duration) error {
 	req := &writeReq{pkt: pkt, result: make(chan error, 1)}
+	t := time.NewTimer(acceptWithin)
+	defer t.Stop()
 	select {
 	case s.writeCh <- req:
 	case <-s.workCtx.Done():
 		return errWriteNotAccepted
+	case <-t.C:
+		return fmt.Errorf("%w within %s", errWriteNotAccepted, acceptWithin)
 	}
 	return <-req.result
 }
