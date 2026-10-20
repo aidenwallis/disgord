@@ -17,9 +17,14 @@ func newClientPktQueue(limit int) clientPktQueue {
 }
 
 // clientPktQueue is an ordered queue. Entries are not removed unless they are successfully written to the websocket.
+//
+// Writing happens outside the lock: Begin moves the head into an inflight slot (which still counts against the
+// limit), and the writer then either Commits it or Rolls it back to the head of the queue. Delivery is therefore
+// at-least-once: a write that fails ambiguously is sent again on the next connection.
 type clientPktQueue struct {
 	sync.RWMutex
 	messages []*clientPacket
+	inflight *clientPacket
 	limit    int
 }
 
@@ -52,7 +57,7 @@ func (c *clientPktQueue) Add(msg *clientPacket) error {
 
 	c.Lock()
 	defer c.Unlock()
-	if len(c.messages) == c.limit {
+	if c.limit >= 0 && c.size() >= c.limit {
 		return errors.New("can not send anymore messages, queue is full")
 	}
 
@@ -60,24 +65,60 @@ func (c *clientPktQueue) Add(msg *clientPacket) error {
 	return nil
 }
 
-func (c *clientPktQueue) Try(cb func(msg *clientPacket) error) error {
+func (c *clientPktQueue) size() int {
+	if c.inflight != nil {
+		return len(c.messages) + 1
+	}
+	return len(c.messages)
+}
+
+// Begin removes the head of the queue and marks it as inflight. Returns nil if the queue is empty or another
+// message is already inflight.
+func (c *clientPktQueue) Begin() *clientPacket {
 	c.Lock()
 	defer c.Unlock()
-	if len(c.messages) == 0 {
-		return nil // nothing to try, this avoid a potential race as well
+	if c.inflight != nil || len(c.messages) == 0 {
+		return nil
 	}
 
-	next := c.messages[0]
-	if err := cb(next); err != nil {
-		return err
-	}
-
+	c.inflight = c.messages[0]
 	// shift to avoid re-allocations
-	for i := 0; i < len(c.messages)-1; i++ {
-		c.messages[i] = c.messages[i+1]
-	}
+	copy(c.messages, c.messages[1:])
+	c.messages[len(c.messages)-1] = nil
 	c.messages = c.messages[:len(c.messages)-1]
-	return nil
+	return c.inflight
+}
+
+// Commit drops the inflight message after it was written.
+func (c *clientPktQueue) Commit(msg *clientPacket) {
+	c.Lock()
+	defer c.Unlock()
+	if c.inflight == msg {
+		c.inflight = nil
+	}
+}
+
+// Rollback puts the inflight message back at the head of the queue. A presence update is dropped instead when a
+// newer one was queued meanwhile; the newest presence wins.
+func (c *clientPktQueue) Rollback(msg *clientPacket) {
+	c.Lock()
+	defer c.Unlock()
+	if c.inflight != msg {
+		return
+	}
+	c.inflight = nil
+
+	if msg.Op == opcode.EventStatusUpdate {
+		for i := range c.messages {
+			if c.messages[i].Op == opcode.EventStatusUpdate {
+				return
+			}
+		}
+	}
+
+	c.messages = append(c.messages, nil)
+	copy(c.messages[1:], c.messages)
+	c.messages[0] = msg
 }
 
 func (c *clientPktQueue) Steal() (m []*clientPacket) {

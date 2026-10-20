@@ -189,7 +189,10 @@ type ShardManagerConfig struct {
 	HTTPClient   *http.Client
 	Logger       logger.Logger
 	ShutdownChan chan interface{}
-	conn         Conn
+
+	// for testing only
+	newConn  func() (sessionConn, error)
+	timeouts *timeouts
 
 	// ...
 	IgnoreEvents []string
@@ -237,6 +240,7 @@ func (s *shardMngr) initShards() error {
 		// synchronization
 		EventChan:    s.conf.EventChan,
 		connectQueue: s.connectQueue,
+		identifySync: s.sync,
 
 		// user settings
 		BotToken:   s.conf.BotToken,
@@ -274,7 +278,8 @@ func (s *shardMngr) initShards() error {
 				s.conf.Logger.Info("scaling", "connected")
 			}
 		},
-		conn: s.conf.conn,
+		newConn:  s.conf.newConn,
+		timeouts: s.conf.timeouts,
 	}
 
 	for _, id := range s.conf.ShardIDs {
@@ -309,9 +314,8 @@ func (s *shardMngr) Connect() (err error) {
 	}
 
 	for _, shard := range s.shards {
-		err := shard.reconnectLoop()
-		if err != nil {
-			s.conf.Logger.Error(err)
+		if err := shard.Connect(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -325,11 +329,7 @@ func (s *shardMngr) Disconnect() error {
 		if err != nil {
 			s.conf.Logger.Error("Disconnect error (trivial):", err)
 		}
-		// possible connect/disconnect race..
-		shard.sessionID = ""
-		shard.sequenceNumber.Store(0)
-
-		shard.haveConnectedOnce.Store(false)
+		shard.resetSession()
 	}
 	return nil
 }

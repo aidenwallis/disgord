@@ -96,7 +96,8 @@ type voiceIdentify struct {
 //////////////////////////////////////////////////////
 
 type evtReadyPacket struct {
-	SessionID string `json:"session_id"`
+	SessionID        string `json:"session_id"`
+	ResumeGatewayURL string `json:"resume_gateway_url"`
 }
 
 type evtIdentity struct {
