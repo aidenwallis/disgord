@@ -45,6 +45,20 @@ func ConfigureShardConfig(ctx context.Context, client GatewayBotGetter, conf *Sh
 		conf.URL = data.URL
 	}
 
+	conf.sessionStart = sessionStartLimit{}
+	if ssl := data.SessionStartLimit; ssl.Total > 0 {
+		conf.sessionStart = sessionStartLimit{
+			total:      ssl.Total,
+			remaining:  ssl.Remaining,
+			resetAfter: time.Duration(ssl.ResetAfter) * time.Millisecond,
+			observedAt: time.Now(),
+		}
+		// Discord's allowance is authoritative; it must win over the static default below
+		if conf.IdentifiesPer24H == 0 {
+			conf.IdentifiesPer24H = ssl.Total
+		}
+	}
+
 	if conf.IdentifiesPer24H == 0 {
 		conf.IdentifiesPer24H = DefaultIdentifyRateLimit
 	}
@@ -162,6 +176,9 @@ type ShardConfig struct {
 
 	// URL is fetched from the gateway before initialising a connection
 	URL string
+
+	// sessionStart is Discord's session_start_limit, populated by ConfigureShardConfig
+	sessionStart sessionStartLimit
 }
 
 // ShardManagerConfig all fields, except proxy.Dialer, is required
