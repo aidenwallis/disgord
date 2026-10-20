@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 
 	"github.com/aidenwallis/disgord/internal/gateway"
 	"github.com/aidenwallis/disgord/internal/gateway/cmd"
@@ -107,42 +106,23 @@ func (g gatewayQueryBuilder) Connect() (err error) {
 	return nil
 }
 
-// gatewayShutdown makes Disconnect safe to call concurrently and to retry: the shutdown channels are closed
-// exactly once and every call waits for the same shard manager shutdown.
-// TODO: move onto Client once client.go can be changed alongside it.
-type gatewayShutdown struct {
-	dispatcherOnce sync.Once
-	systemOnce     sync.Once
-}
-
-var gatewayShutdowns sync.Map // *Client -> *gatewayShutdown
-
-func gatewayShutdownFor(c *Client) *gatewayShutdown {
-	v, _ := gatewayShutdowns.LoadOrStore(c, &gatewayShutdown{})
-	return v.(*gatewayShutdown)
-}
-
 // Disconnect closes the discord websocket connection. It may be retried if it returned an error (e.g. a shard did
 // not stop in time); a Client can not be connected again afterwards.
 func (g gatewayQueryBuilder) Disconnect() (err error) {
 	fmt.Println() // to keep ^C on it's own line
 	g.client.log.Info("Closing Discord gateway connection")
-	state := gatewayShutdownFor(g.client)
-	state.dispatcherOnce.Do(func() {
+	g.client.dispatcherShutdownOnce.Do(func() {
 		close(g.client.dispatcher.shutdown)
 	})
 
-	g.client.mu.RLock()
-	sharding := g.client.shardManager
-	g.client.mu.RUnlock()
-	if sharding != nil {
+	if sharding := g.client.getShardManager(); sharding != nil {
 		if err = sharding.Disconnect(); err != nil {
 			g.client.log.Error(err)
 			return err
 		}
 	}
 
-	state.systemOnce.Do(func() {
+	g.client.systemShutdownOnce.Do(func() {
 		close(g.client.shutdownChan)
 	})
 	g.client.log.Info("Disconnected")
@@ -197,10 +177,11 @@ func (g gatewayQueryBuilder) BotReady(cb func()) {
 		ctrl.Lock()
 		defer ctrl.Unlock()
 
-		l := g.client.shardManager.ShardCount()
+		sharding := g.client.getShardManager()
+		l := sharding.ShardCount()
 		if l != uint(len(ctrl.shardReady)) {
 			ctrl.shardReady = make([]bool, l)
-			ctrl.localShardIDs = g.client.shardManager.ShardIDs()
+			ctrl.localShardIDs = sharding.ShardIDs()
 		}
 
 		ctrl.shardReady[evt.ShardID] = true
