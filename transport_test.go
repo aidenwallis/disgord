@@ -5,6 +5,7 @@ package disgord
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"io/ioutil"
 	"net"
@@ -19,15 +20,31 @@ import (
 	"nhooyr.io/websocket"
 )
 
-// newH2Server starts a TLS server that supports HTTP/2 and returns a transport (built by newTransport) trusting it.
-func newH2Server(t *testing.T, handler http.Handler, readIdle, ping time.Duration) (*httptest.Server, *http.Transport) {
+// initDefaultTransport makes http.DefaultTransport set up HTTP/2 like its first request would, which adds h2 to
+// the TLS config newTransport clones.
+func initDefaultTransport(t *testing.T) {
+	t.Helper()
+	dt, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Skipf("unexpected http.DefaultTransport %T", http.DefaultTransport)
+	}
+	dt.CloseIdleConnections()
+}
+
+// newTLSServer starts a TLS server that also supports HTTP/2 and returns a transport (built by newTransport after
+// http.DefaultTransport was used) trusting it.
+func newTLSServer(t *testing.T, handler http.Handler) (*httptest.Server, *http.Transport) {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(handler)
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
-	transport := newTransportWithHealthCheck(nil, readIdle, ping)
+	initDefaultTransport(t)
+	transport := newTransport(nil)
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
 	transport.TLSClientConfig.RootCAs = srv.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 	t.Cleanup(transport.CloseIdleConnections)
 	return srv, transport
@@ -46,9 +63,10 @@ func (r rewriteHost) RoundTrip(req *http.Request) (*http.Response, error) {
 	return r.base.RoundTrip(req)
 }
 
-func TestTransport_RESTOverHTTP2(t *testing.T) {
+// Discord supports HTTP/2, but REST requests must still be sent over HTTP/1.1
+func TestTransport_RESTOverHTTP1(t *testing.T) {
 	var proto int32
-	srv, transport := newH2Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.StoreInt32(&proto, int32(r.ProtoMajor))
 		if r.URL.Path != "/api/v9/users/@me" {
 			http.NotFound(w, r)
@@ -56,7 +74,7 @@ func TestTransport_RESTOverHTTP2(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"1","username":"test"}`))
-	}), defaultH2ReadIdleTimeout, defaultH2PingTimeout)
+	}))
 
 	c, err := NewClient(context.Background(), Config{
 		BotToken:   "test",
@@ -73,13 +91,13 @@ func TestTransport_RESTOverHTTP2(t *testing.T) {
 	if usr.ID != 1 || usr.Username != "test" {
 		t.Fatalf("unexpected user %+v", usr)
 	}
-	if p := atomic.LoadInt32(&proto); p != 2 {
-		t.Fatalf("expected the request over HTTP/2, got HTTP/%d", p)
+	if p := atomic.LoadInt32(&proto); p != 1 {
+		t.Fatalf("expected the request over HTTP/1.1, got HTTP/%d", p)
 	}
 }
 
 func TestTransport_WebsocketUpgradeOverHTTP1(t *testing.T) {
-	srv, transport := newH2Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ws" {
 			_, _ = w.Write([]byte("ok"))
 			return
@@ -99,18 +117,18 @@ func TestTransport_WebsocketUpgradeOverHTTP1(t *testing.T) {
 			return
 		}
 		_ = conn.Write(r.Context(), typ, msg)
-	}), defaultH2ReadIdleTimeout, defaultH2PingTimeout)
+	}))
 	client := &http.Client{Transport: transport}
 
-	// make sure a HTTP/2 connection to the host is cached before dialing
+	// make sure an idle connection to the host is pooled before dialing
 	resp, err := client.Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _ = io.Copy(ioutil.Discard, resp.Body)
 	_ = resp.Body.Close()
-	if resp.ProtoMajor != 2 {
-		t.Fatalf("expected HTTP/2, got %s", resp.Proto)
+	if resp.ProtoMajor != 1 {
+		t.Fatalf("expected HTTP/1.1, got %s", resp.Proto)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -145,6 +163,7 @@ type tcpRelay struct {
 }
 
 type relayConn struct {
+	dropped    int64 // bytes dropped while blackholed, first for 64-bit alignment
 	blackholed int32
 	clientGone chan struct{}
 }
@@ -204,6 +223,7 @@ func (rc *relayConn) pipe(dst, src net.Conn) {
 			return
 		}
 		if atomic.LoadInt32(&rc.blackholed) == 1 {
+			atomic.AddInt64(&rc.dropped, int64(n))
 			continue
 		}
 		if _, err = dst.Write(buf[:n]); err != nil {
@@ -218,13 +238,13 @@ func (r *tcpRelay) connections() []*relayConn {
 	return append([]*relayConn(nil), r.conns...)
 }
 
-// A HTTP/2 connection that silently stops delivering data must be detected and replaced, instead of hanging every
-// request multiplexed over it.
-func TestTransport_HTTP2HealthCheckEvictsDeadConnection(t *testing.T) {
-	const readIdle, ping = 200 * time.Millisecond, 200 * time.Millisecond
-	srv, transport := newH2Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// A connection that silently stops delivering data only holds up the request sent over it: other requests use
+// other connections, and the dead connection is closed once ResponseHeaderTimeout aborts its request.
+func TestTransport_DeadConnectionOnlyFailsItsRequest(t *testing.T) {
+	srv, transport := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
-	}), readIdle, ping)
+	}))
+	transport.ResponseHeaderTimeout = 2 * time.Second
 	relay := newTCPRelay(t, srv.Listener.Addr().String())
 	client := &http.Client{Transport: transport}
 	url := "https://" + relay.ln.Addr().String() + "/"
@@ -239,8 +259,8 @@ func TestTransport_HTTP2HealthCheckEvictsDeadConnection(t *testing.T) {
 			return err
 		}
 		defer resp.Body.Close()
-		if resp.ProtoMajor != 2 {
-			t.Errorf("expected HTTP/2, got %s", resp.Proto)
+		if resp.ProtoMajor != 1 {
+			t.Errorf("expected HTTP/1.1, got %s", resp.Proto)
 		}
 		_, err = io.Copy(ioutil.Discard, resp.Body)
 		return err
@@ -256,39 +276,68 @@ func TestTransport_HTTP2HealthCheckEvictsDeadConnection(t *testing.T) {
 	dead := conns[0]
 	atomic.StoreInt32(&dead.blackholed, 1)
 
-	// a request on the dead connection fails instead of hanging
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+	// the next request reuses the idle, now dead, connection
 	inflight := make(chan error, 1)
-	go func() { inflight <- get(ctx) }()
+	go func() { inflight <- get(context.Background()) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&dead.dropped) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the request was not sent over the dead connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// while it hangs, other requests are sent over a new connection
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := get(ctx); err != nil {
+		t.Fatalf("request next to the dead connection failed: %s", err)
+	}
+	if n := len(relay.connections()); n != 2 {
+		t.Fatalf("expected a second connection, got %d connections", n)
+	}
+
 	select {
-	case <-inflight:
-	case <-time.After(25 * (readIdle + ping)):
-		t.Fatal("request on a dead HTTP/2 connection was not aborted")
+	case err := <-inflight:
+		if err == nil || !strings.Contains(err.Error(), "timeout awaiting response headers") {
+			t.Fatalf("expected the request on the dead connection to time out, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("request on the dead connection was not aborted")
 	}
 
 	select {
 	case <-dead.clientGone:
-	case <-time.After(25 * (readIdle + ping)):
-		t.Fatal("dead HTTP/2 connection was not closed")
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := get(ctx); err != nil {
-		t.Fatalf("request after the dead connection was evicted failed: %s", err)
-	}
-	if n := len(relay.connections()); n < 2 {
-		t.Fatalf("expected a fresh connection, got %d connections", n)
+	case <-time.After(10 * time.Second):
+		t.Fatal("dead connection was not closed")
 	}
 }
 
-func TestTransport_TLSNextProtos(t *testing.T) {
-	transport := newTransport(nil)
-	if transport.TLSClientConfig == nil || !strings.Contains(strings.Join(transport.TLSClientConfig.NextProtos, ","), "h2") {
-		t.Fatal("expected HTTP/2 to be negotiated")
+func nextProtos(t *http.Transport) string {
+	if t.TLSClientConfig == nil {
+		return ""
 	}
-	if _, ok := transport.TLSNextProto["h2"]; !ok {
-		t.Fatal("expected golang.org/x/net/http2 to handle h2 connections")
+	return strings.Join(t.TLSClientConfig.NextProtos, ",")
+}
+
+func TestTransport_HTTP1Only(t *testing.T) {
+	initDefaultTransport(t)
+	defaultProtos := nextProtos(http.DefaultTransport.(*http.Transport))
+
+	transport := newTransport(nil)
+	if transport.ForceAttemptHTTP2 {
+		t.Error("expected HTTP/2 not to be attempted")
+	}
+	if transport.TLSNextProto == nil || len(transport.TLSNextProto) != 0 {
+		t.Errorf("expected a non-nil, empty TLSNextProto to disable HTTP/2, got %v", transport.TLSNextProto)
+	}
+	if protos := nextProtos(transport); strings.Contains(protos, "h2") {
+		t.Errorf("expected h2 not to be offered during the TLS handshake, got %q", protos)
+	}
+	if protos := nextProtos(http.DefaultTransport.(*http.Transport)); protos != defaultProtos {
+		t.Errorf("http.DefaultTransport must not be modified, its protocols changed from %q to %q", defaultProtos, protos)
+	}
+	if transport.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+		t.Errorf("MaxIdleConnsPerHost: got %d", transport.MaxIdleConnsPerHost)
 	}
 }

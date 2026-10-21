@@ -2,30 +2,27 @@ package disgord
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"time"
 
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
 const (
 	defaultResponseHeaderTimeout = 60 * time.Second
-	defaultH2ReadIdleTimeout     = 30 * time.Second
-	defaultH2PingTimeout         = 15 * time.Second
+	defaultMaxIdleConnsPerHost   = 100
 )
 
-// newTransport returns a clone of http.DefaultTransport that also limits the wait for response headers and
-// health checks HTTP/2 connections. When dialer is not nil, every connection is made through it (and environment
-// proxies are ignored).
+// newTransport returns a clone of http.DefaultTransport that only uses HTTP/1.1, keeps more idle connections per
+// host and limits the wait for response headers. When dialer is not nil, every connection is made through it (and
+// environment proxies are ignored).
+//
+// HTTP/2 is disabled on purpose: it multiplexes every REST request over a single connection, so one silently dead
+// connection stalls all of them until it is detected. With HTTP/1.1 a dead connection only holds up the request
+// using it, until ResponseHeaderTimeout aborts it, while other requests use other connections.
 func newTransport(dialer proxy.Dialer) *http.Transport {
-	return newTransportWithHealthCheck(dialer, defaultH2ReadIdleTimeout, defaultH2PingTimeout)
-}
-
-// newTransportWithHealthCheck is newTransport with custom HTTP/2 health check timeouts: when nothing was read from
-// a connection for readIdle, a ping is sent and the connection is closed unless the ping is answered within ping.
-func newTransportWithHealthCheck(dialer proxy.Dialer, readIdle, ping time.Duration) *http.Transport {
 	var t *http.Transport
 	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
 		t = dt.Clone()
@@ -36,7 +33,6 @@ func newTransportWithHealthCheck(dialer proxy.Dialer, readIdle, ping time.Durati
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
@@ -45,16 +41,29 @@ func newTransportWithHealthCheck(dialer proxy.Dialer, readIdle, ping time.Durati
 	}
 	t.ResponseHeaderTimeout = defaultResponseHeaderTimeout
 
+	// nearly every request goes to discord.com; with the default of 2 idle connections per host, most connections
+	// opened during a burst would be closed again and re-dialed for the next one
+	t.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+
+	// a non-nil, empty TLSNextProto disables HTTP/2
+	t.ForceAttemptHTTP2 = false
+	t.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
+
+	// once http.DefaultTransport was used, its TLS config offers h2 and Clone copies it. Discord would accept h2
+	// and the connection would be unusable, as nothing handles it anymore.
+	if t.TLSClientConfig != nil {
+		var protos []string
+		for _, p := range t.TLSClientConfig.NextProtos {
+			if p != "h2" {
+				protos = append(protos, p)
+			}
+		}
+		t.TLSClientConfig.NextProtos = protos
+	}
+
 	if dialer != nil {
 		t.Proxy = nil
 		t.DialContext = proxyDialContext(dialer)
-	}
-
-	// REST requests to Discord are multiplexed over a single HTTP/2 connection. Without health checks a silently
-	// dead connection hangs every request until the OS gives up on it, which can take many minutes.
-	if h2, err := http2.ConfigureTransports(t); err == nil {
-		h2.ReadIdleTimeout = readIdle
-		h2.PingTimeout = ping
 	}
 	return t
 }

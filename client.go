@@ -21,8 +21,8 @@ import (
 )
 
 // DefaultHttpClient is used for REST requests and websocket connections when Config does not specify a client.
-// Its transport is a clone of http.DefaultTransport that also limits the wait for response headers and health
-// checks HTTP/2 connections. Changing it affects every Client relying on it.
+// Its transport is a clone of http.DefaultTransport that only uses HTTP/1.1, keeps more idle connections per host
+// and limits the wait for response headers. Changing it affects every Client relying on it.
 var DefaultHttpClient = &http.Client{Transport: newTransport(nil)}
 
 // New create a Client. But panics on configuration/setup errors.
