@@ -150,6 +150,16 @@ func TestClient_RESTRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestClient_EventChanBuffer(t *testing.T) {
+	c, err := NewClient(context.Background(), Config{BotToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(c.eventChan) != 256 {
+		t.Fatalf("expected an event buffer of 256, got %d", cap(c.eventChan))
+	}
+}
+
 func TestDefaultHttpClient_Transport(t *testing.T) {
 	transport, ok := DefaultHttpClient.Transport.(*http.Transport)
 	if !ok {

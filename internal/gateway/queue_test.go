@@ -4,7 +4,7 @@
 package gateway
 
 import (
-	"errors"
+	"sync"
 	"testing"
 
 	"github.com/aidenwallis/disgord/internal/gateway/opcode"
@@ -100,31 +100,94 @@ func TestClientPktQueue_Steal(t *testing.T) {
 	}
 }
 
-func TestClientPktQueue_Try(t *testing.T) {
+func TestClientPktQueue_BeginCommitRollback(t *testing.T) {
 	q := newClientPktQueue(10)
 
-	_ = q.Add(&clientPacket{})
-	if err := q.Try(func(msg *clientPacket) error { return errors.New("") }); err == nil {
-		t.Error("Try should fail when cb returns an error")
-	}
-	if len(q.messages) != 1 {
-		t.Error("the number of entries in the queue should not reduce after a failed Try execution")
+	if q.Begin() != nil {
+		t.Fatal("Begin on an empty queue must return nil")
 	}
 
-	if err := q.Try(func(msg *clientPacket) error { return nil }); err != nil {
-		t.Error("Try should not have failed", err)
+	first, second := &clientPacket{CmdName: "1"}, &clientPacket{CmdName: "2"}
+	_ = q.Add(first)
+	_ = q.Add(second)
+
+	msg := q.Begin()
+	if msg != first {
+		t.Fatal("Begin must return the head of the queue")
 	}
-	if !q.IsEmpty() {
-		t.Error("queue should be empty")
+	if q.Begin() != nil {
+		t.Fatal("only one message can be inflight")
+	}
+	q.Rollback(msg)
+	if len(q.messages) != 2 || q.messages[0] != first {
+		t.Fatal("a rolled back message must return to the head of the queue")
 	}
 
-	_ = q.Add(&clientPacket{})
-	_ = q.Add(&clientPacket{})
-	_ = q.Add(&clientPacket{})
-	if err := q.Try(func(msg *clientPacket) error { return nil }); err != nil {
-		t.Error("Try should not have failed", err)
+	msg = q.Begin()
+	q.Commit(msg)
+	if len(q.messages) != 1 || q.messages[0] != second || q.inflight != nil {
+		t.Fatal("a committed message must leave the queue")
 	}
-	if len(q.messages) != 2 {
-		t.Error("the number of entries in the queue should reduce after Try execution")
+
+	// commit/rollback by a stale owner is ignored
+	msg = q.Begin()
+	q.Rollback(first)
+	q.Commit(first)
+	if q.inflight != msg {
+		t.Fatal("only the owner of the inflight message may commit or roll it back")
+	}
+}
+
+// Astra R2#9 / test 37: the inflight message counts against the limit, so concurrent enqueues during a failed
+// write can never overflow the queue.
+func TestClientPktQueue_InflightCountsAgainstLimit(t *testing.T) {
+	limit := 3
+	q := newClientPktQueue(limit)
+	for i := 0; i < limit; i++ {
+		if err := q.Add(&clientPacket{Op: opcode.EventRequestGuildMembers}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msg := q.Begin()
+	if err := q.Add(&clientPacket{Op: opcode.EventRequestGuildMembers}); err == nil {
+		t.Fatal("queue must be full while a message is inflight")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = q.Add(&clientPacket{Op: opcode.EventRequestGuildMembers})
+		}()
+	}
+	q.Rollback(msg)
+	wg.Wait()
+	if n := len(q.messages); n > limit {
+		t.Fatalf("queue exceeded its limit: %d > %d", n, limit)
+	}
+}
+
+func TestClientPktQueue_PresenceNewestWins(t *testing.T) {
+	q := newClientPktQueue(10)
+	older := &clientPacket{Op: opcode.EventStatusUpdate, CmdName: "older"}
+	newer := &clientPacket{Op: opcode.EventStatusUpdate, CmdName: "newer"}
+
+	_ = q.Add(older)
+	inflight := q.Begin()
+	_ = q.Add(newer) // queued while the older presence is being written
+	q.Rollback(inflight)
+
+	if len(q.messages) != 1 || q.messages[0] != newer {
+		t.Fatalf("expected only the newest presence to remain, got %d messages", len(q.messages))
+	}
+
+	// without a newer presence, a failed presence write is retried
+	q = newClientPktQueue(10)
+	_ = q.Add(older)
+	inflight = q.Begin()
+	q.Rollback(inflight)
+	if len(q.messages) != 1 || q.messages[0] != older {
+		t.Fatal("a failed presence write must be retried when nothing newer was queued")
 	}
 }

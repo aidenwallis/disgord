@@ -15,6 +15,7 @@ import (
 	"github.com/aidenwallis/disgord/json"
 
 	"github.com/aidenwallis/disgord/internal/gateway/opcode"
+	"github.com/aidenwallis/disgord/internal/logger"
 )
 
 const SaveIncomingPackets = true
@@ -73,22 +74,22 @@ func ensureDir() {
 // unix is the unix timestamp on save
 // seq is the sequence number: outgoingPacketSequence
 // op is the operation code
-func saveOutgoingPacket(c *client, packet *clientPacket) {
+func saveOutgoingPacket(log logger.Logger, prefix string, clientType ClientType, shardID uint, packet *clientPacket) {
 	ensureDir()
 	data, err := json.MarshalIndent(packet, "", "\t")
 	if err != nil {
-		c.log.Debug(c.getLogPrefix(), err)
+		log.Debug(prefix, err)
 	}
 
 	nr := atomic.AddUint64(&outgoingPacketSequence, 1)
-	filename := formatFilename(false, c.clientType, c.ShardID, packet.Op, nr, "")
+	filename := formatFilename(false, clientType, shardID, packet.Op, nr, "")
 
 	path := DiagnosePath_packets + "/" + filename
 	if err = ioutil.WriteFile(path, data, 0644); err != nil {
-		c.log.Debug(c.getLogPrefix(), err)
+		log.Debug(prefix, err)
 	}
 
-	c.log.Info(c.getLogPrefix(), "saved "+filename)
+	log.Info(prefix, "saved "+filename)
 }
 
 // saveIncomingPacker saves raw json content to disk
@@ -97,25 +98,25 @@ func saveOutgoingPacket(c *client, packet *clientPacket) {
 // seq is the sequence number
 // op is the operation code
 // evt_name is the event name (optional)
-func saveIncomingPacker(c *client, evt *DiscordPacket, packet []byte) {
+func saveIncomingPacker(log logger.Logger, prefix string, clientType ClientType, shardID uint, evt *DiscordPacket, packet []byte) {
 	ensureDir()
 	evtStr := "_" + evt.EventName
 	if evtStr == "_" {
 		evtStr = "_EMPTY"
 	}
 
-	filename := formatFilename(true, c.clientType, c.ShardID, evt.Op, uint64(evt.SequenceNumber), evtStr)
+	filename := formatFilename(true, clientType, shardID, evt.Op, uint64(evt.SequenceNumber), evtStr)
 	path := DiagnosePath_packets + "/" + filename
 
 	// pretty
 	var prettyJSON bytes.Buffer
 	if err := json.Indent(&prettyJSON, packet, "", "\t"); err != nil {
-		c.log.Debug(c.getLogPrefix(), err)
+		log.Debug(prefix, err)
 	}
 
 	if err := ioutil.WriteFile(path, prettyJSON.Bytes(), 0644); err != nil {
-		c.log.Debug(c.getLogPrefix(), err)
+		log.Debug(prefix, err)
 	}
 
-	c.log.Info(c.getLogPrefix(), "saved "+filename)
+	log.Info(prefix, "saved "+filename)
 }

@@ -189,7 +189,10 @@ type ShardManagerConfig struct {
 	HTTPClient   *http.Client
 	Logger       logger.Logger
 	ShutdownChan chan interface{}
-	conn         Conn
+
+	// for testing only
+	newConn  func() (sessionConn, error)
+	timeouts *timeouts
 
 	// ...
 	IgnoreEvents []string
@@ -237,6 +240,7 @@ func (s *shardMngr) initShards() error {
 		// synchronization
 		EventChan:    s.conf.EventChan,
 		connectQueue: s.connectQueue,
+		identifySync: s.sync,
 
 		// user settings
 		BotToken:   s.conf.BotToken,
@@ -244,6 +248,8 @@ func (s *shardMngr) initShards() error {
 
 		// other
 		SystemShutdown: s.conf.ShutdownChan,
+		// NOTE: not invoked by the event client. Autoscaling on 4011 is not wired: this listener would re-lock
+		// s.mu and race the shard lifecycle; 4011 stops the shard with an error instead.
 		discordErrListener: func(code int, reason string) {
 			if code != discordErrShardScalingRequired {
 				return
@@ -274,7 +280,8 @@ func (s *shardMngr) initShards() error {
 				s.conf.Logger.Info("scaling", "connected")
 			}
 		},
-		conn: s.conf.conn,
+		newConn:  s.conf.newConn,
+		timeouts: s.conf.timeouts,
 	}
 
 	for _, id := range s.conf.ShardIDs {
@@ -294,6 +301,10 @@ func (s *shardMngr) initShards() error {
 	return nil
 }
 
+// Connect starts every shard without waiting for them to connect: their identifies are spaced by the connect
+// queue and each shard reconnects on its own. A shard that is closed with a close code that can not be recovered
+// from stops and logs why. If a shard can not be started the error is returned; the shards started before it keep
+// running until Disconnect.
 func (s *shardMngr) Connect() (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -308,28 +319,25 @@ func (s *shardMngr) Connect() (err error) {
 		}
 	}
 
-	for _, shard := range s.shards {
-		err := shard.reconnectLoop()
-		if err != nil {
-			s.conf.Logger.Error(err)
+	for id, shard := range s.shards {
+		if _, err = shard.start(); err != nil {
+			return fmt.Errorf("shard %d: %w", id, err)
 		}
 	}
 	return nil
 }
+
+// Disconnect stops every shard. Each shard is waited for, bounded; one that did not stop in time can only be
+// connected again once it did.
 func (s *shardMngr) Disconnect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, shard := range s.shards {
-		err := shard.Disconnect()
-		if err != nil {
+		if err := shard.Disconnect(); err != nil && !errors.Is(err, ErrNotConnected) {
 			s.conf.Logger.Error("Disconnect error (trivial):", err)
 		}
-		// possible connect/disconnect race..
-		shard.sessionID = ""
-		shard.sequenceNumber.Store(0)
-
-		shard.haveConnectedOnce.Store(false)
+		shard.resetSession()
 	}
 	return nil
 }
@@ -349,6 +357,8 @@ func (s *shardMngr) ShardCount() uint {
 }
 
 func (s *shardMngr) ShardIDs() (shardIDs []uint) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for id := range s.shards {
 		shardIDs = append(shardIDs, id)
 	}
@@ -356,7 +366,8 @@ func (s *shardMngr) ShardIDs() (shardIDs []uint) {
 }
 
 // Emit splits up and dispatches the payload into the correct shards
-// returns the guild ids it can not support and a error message
+// returns the guild ids it can not support and a error message.
+// It must not call any method that takes s.mu again (a pending writer would deadlock the read lock).
 func (s *shardMngr) Emit(cmd string, payload CmdPayload) (guildIDs []Snowflake, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -375,7 +386,7 @@ func (s *shardMngr) Emit(cmd string, payload CmdPayload) (guildIDs []Snowflake, 
 
 		requests := make(map[uint][]Snowflake)
 		for i := range t.GuildIDs {
-			shardID := GetShardForGuildID(t.GuildIDs[i], s.ShardCount())
+			shardID := GetShardForGuildID(t.GuildIDs[i], s.conf.ShardCount)
 			requests[shardID] = append(requests[shardID], t.GuildIDs[i])
 		}
 
@@ -392,7 +403,7 @@ func (s *shardMngr) Emit(cmd string, payload CmdPayload) (guildIDs []Snowflake, 
 			}
 		}
 	case *UpdateVoiceStatePayload:
-		shardID := GetShardForGuildID(t.GuildID, s.ShardCount())
+		shardID := GetShardForGuildID(t.GuildID, s.conf.ShardCount)
 		if shard, ok := s.shards[shardID]; ok {
 			err = shard.Emit(cmd, payload)
 		} else {
@@ -422,6 +433,8 @@ func (s *shardMngr) GetShard(shardID shardID) (shard *EvtClient, err error) {
 }
 
 func (s *shardMngr) HeartbeatLatencies() (latencies map[shardID]time.Duration, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	latencies = make(map[shardID]time.Duration)
 	for id := range s.shards {
 		latencies[id], err = s.shards[id].HeartbeatLatency()

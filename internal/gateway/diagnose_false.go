@@ -3,7 +3,10 @@
 
 package gateway
 
+import "github.com/aidenwallis/disgord/internal/logger"
+
 const SaveIncomingPackets = false
 
-func saveOutgoingPacket(c *client, packet *clientPacket)                {}
-func saveIncomingPacker(c *client, event *DiscordPacket, packet []byte) {}
+func saveOutgoingPacket(_ logger.Logger, _ string, _ ClientType, _ uint, _ *clientPacket) {}
+func saveIncomingPacker(_ logger.Logger, _ string, _ ClientType, _ uint, _ *DiscordPacket, _ []byte) {
+}
