@@ -178,12 +178,16 @@ func (b *ltBucket) updateAfterRequest(header http.Header, statusCode int) (adjus
 	isGlobal = isGlobal || header.Get(XRateLimitGlobal) == "true"
 
 	// if this is not a 429 error we can determine if the local ltBucket is a global one or not
-	if statusCode != http.StatusTooManyRequests && b.hash == "" {
-		if isGlobal {
-			b.hash = GlobalHash
-		} else if bucketHash != "" {
-			b.hash = bucketHash
+	if statusCode != http.StatusTooManyRequests {
+		b.mu.Lock()
+		if b.hash == "" {
+			if isGlobal {
+				b.hash = GlobalHash
+			} else if bucketHash != "" {
+				b.hash = bucketHash
+			}
 		}
+		b.mu.Unlock()
 	}
 
 	var reset time.Time
@@ -216,7 +220,9 @@ func (b *ltBucket) updateAfterRequest(header http.Header, statusCode int) (adjus
 	} else {
 		bucket = b // no need to lock normal buckets
 		if !(b.global == nil || b == b.global) && bucketHash != "" {
+			b.mu.Lock()
 			b.hash = bucketHash
+			b.mu.Unlock()
 		}
 	}
 
@@ -242,6 +248,12 @@ func (b *ltBucket) updateAfterRequest(header http.Header, statusCode int) (adjus
 	}
 
 	return adjustedRemaining
+}
+
+func (b *ltBucket) getHash() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.hash
 }
 
 func (b *ltBucket) active() bool {
