@@ -201,20 +201,22 @@ type EvtClient struct {
 	lastFrameAt    atomic.Int64
 
 	// mu guards the shared shard state below. Sessions only mutate it while they are current.
-	mu             sync.Mutex
-	current        *session
-	identSess      *session // current session waiting for its identify turn
-	identReq       *identifyRequest
-	abandonedDials int           // Opens given up on that have not returned yet
-	dialReturned   chan struct{} // closed (and replaced) whenever an abandoned Open returns
-	sessionID      string
-	seq            uint32
-	hasSeq         bool
-	latency        time.Duration
-	state          shardState
-	stateReason    string
-	degraded       bool
-	ReadyCounter   uint
+	mu                sync.Mutex
+	current           *session
+	identSess         *session // current session waiting for its identify turn
+	identReq          *identifyRequest
+	abandonedDials    int           // Opens given up on that have not returned yet
+	dialReturned      chan struct{} // closed (and replaced) whenever an abandoned Open returns
+	sessionID         string
+	resumeURL         string
+	resumeURLFailures int
+	seq               uint32
+	hasSeq            bool
+	latency           time.Duration
+	state             shardState
+	stateReason       string
+	degraded          bool
+	ReadyCounter      uint
 }
 
 var _ Link = (*EvtClient)(nil)

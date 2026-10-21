@@ -18,7 +18,7 @@ import (
 
 // A session is one websocket connection of an event client together with everything that only lives as long as
 // that connection: contexts, workers, heartbeat state and handshake signals. Shared shard state (session id,
-// sequence number, latency, state) lives on the EvtClient and is only mutated by a session while it
+// sequence number, resume url, latency, state) lives on the EvtClient and is only mutated by a session while it
 // is the client's current session.
 type session struct {
 	id  uint64
@@ -403,6 +403,8 @@ func (s *session) onDispatch(p *DiscordPacket, now time.Time) {
 		}
 		if ready != nil {
 			c.sessionID = ready.SessionID
+			c.resumeURL = ready.ResumeGatewayURL
+			c.resumeURLFailures = 0
 			c.ReadyCounter++
 		}
 	}

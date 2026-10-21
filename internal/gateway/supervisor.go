@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"sync"
 	"time"
 
@@ -371,8 +372,9 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 func (c *EvtClient) clearSession() {
 	c.mu.Lock()
-	c.sessionID = ""
+	c.sessionID, c.resumeURL = "", ""
 	c.seq, c.hasSeq = 0, false
+	c.resumeURLFailures = 0
 	c.mu.Unlock()
 }
 
@@ -387,6 +389,36 @@ func (c *EvtClient) resetSession() {
 	c.haveConnectedOnce.Store(false)
 }
 
+// endpointFor returns the endpoint for the next connection. RESUMEs use Discord's resume_gateway_url with the
+// base endpoint's query parameters, until it failed twice in a row before HELLO.
+func (c *EvtClient) endpointFor(resumable bool) (endpoint string, viaResumeURL bool) {
+	base := c.evtConf.Endpoint
+	c.mu.Lock()
+	resumeURL, failures := c.resumeURL, c.resumeURLFailures
+	c.mu.Unlock()
+	if !resumable || resumeURL == "" || failures >= 2 {
+		return base, false
+	}
+
+	u, err := url.Parse(resumeURL)
+	if err != nil || u.Host == "" {
+		return base, false
+	}
+	if b, err := url.Parse(base); err == nil {
+		u.RawQuery = b.RawQuery
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return u.String(), true
+}
+
+func (c *EvtClient) noteResumeURLFailure() {
+	c.mu.Lock()
+	c.resumeURLFailures++
+	c.mu.Unlock()
+}
+
 // ---------------------------------------------------------------------------
 // attempt: one connection from dial to teardown
 // ---------------------------------------------------------------------------
@@ -397,6 +429,7 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 	c.mu.Lock()
 	resumable := c.sessionID != ""
 	c.mu.Unlock()
+	endpoint, viaResumeURL := c.endpointFor(resumable)
 
 	out.phase = phaseDial
 	if !resumable && !c.awaitAdmissionWindow(r) {
@@ -409,11 +442,14 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 	}
 
 	c.setState(stateConnecting, "")
-	conn, err := c.dial(r, c.evtConf.Endpoint)
+	conn, err := c.dial(r, endpoint)
 	if err != nil {
 		if r.ctx.Err() != nil {
 			out.reason = stopFailure
 			return out
+		}
+		if viaResumeURL {
+			c.noteResumeURLFailure()
 		}
 		out.reason = failReason{kind: failTransport, err: fmt.Errorf("dial: %w", err)}
 		return out
@@ -433,7 +469,7 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 	sess.wgWork.Add(1)
 	go sess.write()
 
-	out = c.establish(r, sess, resumable)
+	out = c.establish(r, sess, resumable, viaResumeURL)
 	if out.reachedReady {
 		select {
 		case <-sess.failed:
@@ -453,7 +489,7 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 }
 
 // establish performs HELLO, IDENTIFY/RESUME and waits for READY/RESUMED. On failure the session has failed.
-func (c *EvtClient) establish(r *run, sess *session, resumable bool) (out outcome) {
+func (c *EvtClient) establish(r *run, sess *session, resumable, viaResumeURL bool) (out outcome) {
 	out.phase = phaseHello
 	helloTimer := time.NewTimer(c.to.hello)
 	var hello helloInfo
@@ -467,7 +503,15 @@ func (c *EvtClient) establish(r *run, sess *session, resumable bool) (out outcom
 	}
 	helloTimer.Stop()
 	if sess.isFailed() {
+		if viaResumeURL {
+			c.noteResumeURLFailure()
+		}
 		return out
+	}
+	if viaResumeURL {
+		c.mu.Lock()
+		c.resumeURLFailures = 0
+		c.mu.Unlock()
 	}
 
 	sess.interval.Store(int64(hello.interval))
@@ -891,7 +935,7 @@ func (c *EvtClient) identifyTurn(q *identifyRequest) error {
 	c.identSess = nil
 	// Reset before IDENTIFY reaches the writer: READY may be committed before this turn observes the write, and a
 	// leftover sequence number would make READY (s=1) look like a duplicate.
-	c.sessionID = ""
+	c.sessionID, c.resumeURL = "", ""
 	c.seq, c.hasSeq = 0, false
 	c.mu.Unlock()
 
