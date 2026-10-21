@@ -18,8 +18,8 @@ import (
 
 // A session is one websocket connection of an event client together with everything that only lives as long as
 // that connection: contexts, workers, heartbeat state and handshake signals. Shared shard state (session id,
-// sequence number, latency) lives on the EvtClient and is only mutated by a session while it is the client's
-// current session.
+// sequence number, latency, state) lives on the EvtClient and is only mutated by a session while it
+// is the client's current session.
 type session struct {
 	id  uint64
 	c   *EvtClient
@@ -60,11 +60,15 @@ type session struct {
 	interval    atomic.Int64 // heartbeat interval from HELLO, nanoseconds
 	readyAtNano atomic.Int64
 
+	stall      stallClock
 	lastFrame  atomic.Int64 // unix nano
 	progressMu sync.Mutex
-	progress   time.Time // last dispatch frame, or when the wait for READY/RESUMED started
+	progress   readableMark // last dispatch frame, or the IDENTIFY/RESUME write
 
 	hb hbState
+
+	stallReported bool // heartbeat goroutine only
+	lastStallLog  time.Time
 
 	sentClose atomic.Int32 // close code we sent; 0 until teardown sends one
 }
@@ -175,18 +179,75 @@ func (s *session) markIdentified(err error) {
 }
 
 // ---------------------------------------------------------------------------
-// READY/RESUMED progress
+// readable time: wall time minus the time the receiver spent blocked on the event channel
 // ---------------------------------------------------------------------------
 
-func (s *session) setProgress(t time.Time) {
+type stallClock struct {
+	mu    sync.Mutex
+	total time.Duration
+	since time.Time // zero unless currently stalled
+}
+
+func (s *stallClock) begin(now time.Time) {
+	s.mu.Lock()
+	s.since = now
+	s.mu.Unlock()
+}
+
+func (s *stallClock) end(now time.Time) {
+	s.mu.Lock()
+	if !s.since.IsZero() {
+		s.total += now.Sub(s.since)
+		s.since = time.Time{}
+	}
+	s.mu.Unlock()
+}
+
+func (s *stallClock) totalAt(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := s.total
+	if !s.since.IsZero() {
+		total += now.Sub(s.since)
+	}
+	return total
+}
+
+func (s *stallClock) current(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.since.IsZero() {
+		return 0
+	}
+	return now.Sub(s.since)
+}
+
+type readableMark struct {
+	at    time.Time
+	stall time.Duration
+}
+
+func (s *session) markAt(now time.Time) readableMark {
+	return readableMark{at: now, stall: s.stall.totalAt(now)}
+}
+
+func (s *session) readableSince(m readableMark, now time.Time) time.Duration {
+	d := now.Sub(m.at) - (s.stall.totalAt(now) - m.stall)
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func (s *session) setProgress(m readableMark) {
 	s.progressMu.Lock()
-	if t.After(s.progress) {
-		s.progress = t
+	if m.at.After(s.progress.at) {
+		s.progress = m
 	}
 	s.progressMu.Unlock()
 }
 
-func (s *session) lastProgress() time.Time {
+func (s *session) lastProgress() readableMark {
 	s.progressMu.Lock()
 	defer s.progressMu.Unlock()
 	return s.progress
@@ -277,7 +338,7 @@ func (s *session) onHeartbeatAck(now time.Time) {
 		latency = now.Sub(s.hb.lastBeat)
 	}
 	s.hb.outstanding = false
-	s.hb.anchor = time.Time{}
+	s.hb.anchor = readableMark{}
 	s.hb.mu.Unlock()
 
 	if latency > 0 {
@@ -296,7 +357,7 @@ func (s *session) onDispatch(p *DiscordPacket, now time.Time) {
 		return
 	}
 	c := s.c
-	s.setProgress(now)
+	s.setProgress(s.markAt(now))
 
 	c.mu.Lock()
 	if c.current != s {
@@ -352,9 +413,17 @@ func (s *session) onDispatch(p *DiscordPacket, now time.Time) {
 	}
 }
 
-// forward hands an event to the shared event channel. It gives up once the session failed, so a blocked
-// consumer can never keep a retired session alive.
+// forward hands an event to the shared event channel. Time spent blocked here is excluded from readable time:
+// a slow consumer must not look like a dead connection.
 func (s *session) forward(evt *Event) bool {
+	select {
+	case s.c.eventChan <- evt:
+		return true
+	default:
+	}
+
+	s.stall.begin(time.Now())
+	defer func() { s.stall.end(time.Now()) }()
 	select {
 	case s.c.eventChan <- evt:
 		return true
@@ -370,7 +439,7 @@ func (s *session) forward(evt *Event) bool {
 type hbState struct {
 	mu          sync.Mutex
 	outstanding bool
-	anchor      time.Time // send time of the oldest un-ACKed heartbeat
+	anchor      readableMark // send time of the oldest un-ACKed heartbeat
 	lastBeat    time.Time
 	lastAck     time.Time
 }
@@ -380,7 +449,7 @@ func (s *session) markBeat(now time.Time) {
 	s.hb.mu.Lock()
 	if !s.hb.outstanding {
 		s.hb.outstanding = true
-		s.hb.anchor = now
+		s.hb.anchor = s.markAt(now)
 	}
 	s.hb.lastBeat = now
 	s.hb.mu.Unlock()
@@ -390,7 +459,7 @@ func (s *session) isZombie(interval time.Duration, now time.Time) bool {
 	s.hb.mu.Lock()
 	outstanding, anchor := s.hb.outstanding, s.hb.anchor
 	s.hb.mu.Unlock()
-	return outstanding && now.Sub(anchor) >= interval
+	return outstanding && s.readableSince(anchor, now) >= interval
 }
 
 func (s *session) heartbeat(interval time.Duration) {
@@ -425,28 +494,107 @@ func (s *session) heartbeat(interval time.Duration) {
 			}
 			next.Reset(interval)
 		case <-check.C:
-			if s.isZombie(interval, time.Now()) {
+			now := time.Now()
+			if s.isZombie(interval, now) {
 				s.zombie(interval)
 				return
 			}
+			s.observeStall(interval, now)
 		}
 	}
 }
 
 func (s *session) zombie(interval time.Duration) {
-	s.c.log.Info(s.prefix(), "heartbeat ACK was not received within", interval, "reconnecting")
+	s.c.log.Info(s.prefix(), "heartbeat ACK was not received within", interval, "of readable time, reconnecting")
 	s.fail(failReason{kind: failZombie})
+}
+
+// observeStall reports back-pressure. The session is intentionally never failed because of it: reconnecting
+// cannot unblock the consumer and would only lose the session or events.
+func (s *session) observeStall(interval time.Duration, now time.Time) {
+	c := s.c
+	stalled := s.stall.current(now)
+	switch {
+	case stalled > interval && !s.stallReported:
+		s.stallReported = true
+		s.lastStallLog = now
+		c.setDegraded(s, true)
+		c.log.Info(s.prefix(), "WARN: event consumer is not keeping up; the shard has been blocked for", stalled.Round(time.Millisecond),
+			"(heartbeats continue, no events are lost)")
+	case s.stallReported && stalled > 0 && now.Sub(s.lastStallLog) >= 5*time.Minute:
+		s.lastStallLog = now
+		c.log.Error(s.prefix(), "event consumer has blocked the shard for", stalled.Round(time.Second))
+	case s.stallReported && stalled == 0:
+		s.stallReported = false
+		c.setDegraded(s, false)
+		c.log.Info(s.prefix(), "event consumer caught up again")
+	}
 }
 
 // ---------------------------------------------------------------------------
 // writer
 // ---------------------------------------------------------------------------
 
+// outboundBudget is a rolling window over every frame sent on this connection (Discord allows 120 per 60s).
+type outboundBudget struct {
+	window time.Duration
+	sent   []time.Time
+}
+
+func (b *outboundBudget) used(now time.Time) int {
+	limit := now.Add(-b.window)
+	var expired int
+	for expired < len(b.sent) && !b.sent[expired].After(limit) {
+		expired++
+	}
+	if expired > 0 {
+		n := copy(b.sent, b.sent[expired:])
+		b.sent = b.sent[:n]
+	}
+	return len(b.sent)
+}
+
+func (b *outboundBudget) record(now time.Time) {
+	b.sent = append(b.sent, now)
+}
+
+// freeAt returns when fewer than limit frames will be inside the window.
+func (b *outboundBudget) freeAt(now time.Time, limit int) time.Time {
+	n := b.used(now)
+	if n < limit {
+		return now
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+	return b.sent[n-limit].Add(b.window)
+}
+
+// outboundLimits derives how many frames user commands and control frames may use, so that the scheduled
+// heartbeats always fit into the hard cap: reserve = ceil(window/interval) + 4.
+func outboundLimits(interval, window time.Duration, hardCap int) (user, control int) {
+	beats := hardCap / 4 // unknown interval: be conservative
+	if interval > 0 {
+		beats = int((window + interval - 1) / interval)
+	}
+	user = hardCap - beats - 4
+	control = hardCap - beats - 2
+	if user < 0 {
+		user = 0
+	}
+	if control < 1 {
+		control = 1
+	}
+	return user, control
+}
+
 func (s *session) write() {
 	defer s.wgWork.Done()
 	defer s.alive.writer.Store(false)
 	c := s.c
 
+	budget := &outboundBudget{window: c.to.outboundWindow}
+	hardCap := c.to.outboundLimit
 	readyCh := s.ready
 	ready := false
 
@@ -454,11 +602,14 @@ func (s *session) write() {
 		if s.workCtx.Err() != nil {
 			return
 		}
+		now := time.Now()
+		used := budget.used(now)
+		userLimit, controlLimit := outboundLimits(time.Duration(s.interval.Load()), budget.window, hardCap)
 
 		// priority 1: heartbeats
 		select {
 		case <-s.beatDue:
-			if !s.sendHeartbeat() {
+			if !s.sendHeartbeat(budget, true) {
 				return
 			}
 			continue
@@ -466,7 +617,7 @@ func (s *session) write() {
 		}
 		select {
 		case <-s.beatNow:
-			if !s.sendHeartbeat() {
+			if !s.sendHeartbeat(budget, false) {
 				return
 			}
 			continue
@@ -474,9 +625,13 @@ func (s *session) write() {
 		}
 
 		// priority 2: IDENTIFY/RESUME
+		var controlCh chan *writeReq
+		if used < controlLimit {
+			controlCh = s.writeCh
+		}
 		select {
-		case req := <-s.writeCh:
-			if !s.sendControl(req) {
+		case req := <-controlCh:
+			if !s.sendControl(budget, req) {
 				return
 			}
 			continue
@@ -491,16 +646,27 @@ func (s *session) write() {
 			default:
 			}
 		}
-		if ready && !c.messageQueue.IsEmpty() {
-			if !s.sendCommand() {
+		pending := ready && !c.messageQueue.IsEmpty()
+		if pending && used < userLimit {
+			if !s.sendCommand(budget) {
 				return
 			}
 			continue
 		}
 
-		// nothing to send right now; wake up for new work
+		// nothing can be sent right now; wake up for new work or when the budget frees up
+		var wake *time.Timer
+		var wakeC <-chan time.Time
+		if controlCh == nil || pending {
+			limit := userLimit
+			if controlCh == nil {
+				limit = controlLimit
+			}
+			wake = time.NewTimer(budget.freeAt(now, limit).Sub(now))
+			wakeC = wake.C
+		}
 		var commands <-chan struct{}
-		if ready {
+		if ready && !pending {
 			commands = c.cmdSignal
 		}
 
@@ -509,14 +675,18 @@ func (s *session) write() {
 		case <-s.workCtx.Done():
 			ok = false
 		case <-s.beatDue:
-			ok = s.sendHeartbeat()
+			ok = s.sendHeartbeat(budget, true)
 		case <-s.beatNow:
-			ok = s.sendHeartbeat()
-		case req := <-s.writeCh:
-			ok = s.sendControl(req)
+			ok = s.sendHeartbeat(budget, false)
+		case req := <-controlCh:
+			ok = s.sendControl(budget, req)
 		case <-readyCh:
 			ready, readyCh = true, nil
 		case <-commands:
+		case <-wakeC:
+		}
+		if wake != nil {
+			wake.Stop()
 		}
 		if !ok {
 			return
@@ -524,23 +694,60 @@ func (s *session) write() {
 	}
 }
 
-func (s *session) writeFrame(pkt *clientPacket) error {
+func (s *session) writeFrame(budget *outboundBudget, pkt *clientPacket) error {
+	// the frame counts against the budget even if the write fails: it may have reached Discord
+	budget.record(time.Now())
 	saveOutgoingPacket(s.c.log, s.prefix(), clientTypeEvent, s.c.ShardID, pkt)
 	return s.conn.WriteJSON(pkt)
 }
 
-func (s *session) sendHeartbeat() bool {
-	pkt := &clientPacket{Op: opcode.EventHeartbeat, Data: s.c.heartbeatSeq(), CmdName: event.Heartbeat}
+// sendHeartbeat writes a heartbeat. Heartbeats may use the whole budget. A scheduled heartbeat waits for budget
+// if that still meets its deadline; a heartbeat requested by Discord (op 1) is never silently ignored: if the hard
+// cap is exhausted the session is reconnected instead.
+func (s *session) sendHeartbeat(budget *outboundBudget, scheduled bool) bool {
+	c := s.c
+	interval := time.Duration(s.interval.Load())
+	hardCap := c.to.outboundLimit
+	now := time.Now()
+
+	if scheduled {
+		if budget.used(now) >= hardCap {
+			s.hb.mu.Lock()
+			deadline := s.hb.lastBeat.Add(interval)
+			s.hb.mu.Unlock()
+			at := budget.freeAt(now, hardCap)
+			if at.After(deadline) {
+				c.log.Error(s.prefix(), "outbound rate limit exhausted, the next heartbeat can not be sent in time; reconnecting")
+				s.fail(failReason{kind: failOutboundExhausted})
+				return false
+			}
+			t := time.NewTimer(at.Sub(now))
+			select {
+			case <-t.C:
+			case <-s.workCtx.Done():
+				t.Stop()
+				return false
+			}
+		}
+	} else if budget.used(now) >= hardCap {
+		// requested heartbeats may use the reserve meant for scheduled ones; the worst case is this reconnect,
+		// never a missed heartbeat deadline or more than hardCap frames per window
+		c.log.Error(s.prefix(), "outbound rate limit exhausted, a requested heartbeat can not be answered; reconnecting")
+		s.fail(failReason{kind: failOutboundExhausted})
+		return false
+	}
+
+	pkt := &clientPacket{Op: opcode.EventHeartbeat, Data: c.heartbeatSeq(), CmdName: event.Heartbeat}
 	s.markBeat(time.Now())
-	if err := s.writeFrame(pkt); err != nil {
+	if err := s.writeFrame(budget, pkt); err != nil {
 		s.fail(failReason{kind: failTransport, err: fmt.Errorf("heartbeat write: %w", err)})
 		return false
 	}
 	return true
 }
 
-func (s *session) sendControl(req *writeReq) bool {
-	err := s.writeFrame(req.pkt)
+func (s *session) sendControl(budget *outboundBudget, req *writeReq) bool {
+	err := s.writeFrame(budget, req.pkt)
 	req.result <- err
 	if err != nil {
 		s.fail(failReason{kind: failTransport, err: fmt.Errorf("%s write: %w", req.pkt.CmdName, err)})
@@ -549,13 +756,13 @@ func (s *session) sendControl(req *writeReq) bool {
 	return true
 }
 
-func (s *session) sendCommand() bool {
+func (s *session) sendCommand(budget *outboundBudget) bool {
 	q := &s.c.messageQueue
 	msg := q.Begin()
 	if msg == nil {
 		return true
 	}
-	if err := s.writeFrame(msg); err != nil {
+	if err := s.writeFrame(budget, msg); err != nil {
 		q.Rollback(msg)
 		s.fail(failReason{kind: failTransport, err: fmt.Errorf("%s write: %w", msg.CmdName, err)})
 		return false
@@ -567,7 +774,7 @@ func (s *session) sendCommand() bool {
 // writeControl hands a control frame to the writer and waits for the write to complete. errWriteNotAccepted
 // means the frame was definitely not written and never will be: writeCh is unbuffered, so the hand-over either
 // happens (the writer then always writes and answers, bounded by its per-write deadline) or it does not happen
-// at all. Acceptance itself is bounded too.
+// at all. Acceptance itself is bounded too, e.g. while the outbound budget holds control frames back.
 func (s *session) writeControl(pkt *clientPacket, acceptWithin time.Duration) error {
 	req := &writeReq{pkt: pkt, result: make(chan error, 1)}
 	t := time.NewTimer(acceptWithin)

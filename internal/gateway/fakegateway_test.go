@@ -828,6 +828,8 @@ func fastTimeouts() *timeouts {
 		disconnect:        15 * time.Second,
 		invalidSessionMin: 10 * time.Millisecond,
 		invalidSessionMax: 50 * time.Millisecond,
+		// the fake gateway heartbeats every few hundred ms; a 60s window would leave no budget for commands
+		outboundWindow: 5 * time.Second,
 	}
 }
 
@@ -907,20 +909,13 @@ func (rc *testShard) connect(t *testing.T) *fakeConn {
 	return fc
 }
 
-// shardStopped reports whether the shard has no run anymore, e.g. after a fatal close code.
-func shardStopped(c *EvtClient) bool {
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-	return c.run == nil
-}
-
 // expectRecovery asserts that, after a fault, a new connection (idx >= minIdx) completes identify/resume,
 // keeps heartbeating, delivers events to the consumer, and accepts outgoing commands.
 func (rc *testShard) expectRecovery(t *testing.T, minIdx int, deadline time.Duration) *fakeConn {
 	t.Helper()
 	fc, ok := rc.gw.waitHealthy(minIdx, -1, 3, deadline)
 	if !ok {
-		t.Fatalf("no healthy connection (idx>=%d, ready + 3 heartbeats) within %v", minIdx, deadline)
+		t.Fatalf("no healthy connection (idx>=%d, ready + 3 heartbeats) within %v; state=%s", minIdx, deadline, rc.c.stateSnapshot())
 	}
 	if err := rc.probeEvent(fc, 10*time.Second); err != nil {
 		t.Fatalf("reconnected on conn #%d but event delivery broken: %v", fc.idx, err)

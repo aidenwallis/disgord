@@ -197,8 +197,11 @@ func TestLifecycle40_CloseCodeAfterWriteError(t *testing.T) {
 				}
 				return
 			}
-			if !waitFor(10*time.Second, func() bool { return shardStopped(ss.c) }) {
-				t.Fatal("expected the shard to stop on the fatal close code")
+			if !waitFor(10*time.Second, func() bool {
+				return ss.c.stateSnapshot() == "stopped (close code 4004)" ||
+					ss.c.stateSnapshot() == "stopped (close code 4014)"
+			}) {
+				t.Fatalf("expected the shard to stop on the fatal close code, state=%q", ss.c.stateSnapshot())
 			}
 			time.Sleep(100 * time.Millisecond)
 			if n := ss.d.count(); n != 1 {
@@ -209,6 +212,54 @@ func TestLifecycle40_CloseCodeAfterWriteError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 33: zombie detection from a fixed anchor despite a 10% receiver stall every interval; an ACK racing the
+// heartbeat write completion is never lost.
+func TestLifecycle33_ZombieWithPeriodicStall(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	ss := newScriptShard(t, nil, nil, nil)
+	ss.events = make(chan *Event) // replaced before Connect: unbuffered so forwarding stalls
+	ss.c.eventChan = ss.events
+	stopConsumer := make(chan struct{})
+	defer close(stopConsumer)
+	go func() {
+		for {
+			select {
+			case <-ss.events:
+				time.Sleep(interval / 40)
+			case <-stopConsumer:
+				return
+			}
+		}
+	}()
+
+	sc := connectScripted(t, ss, int(interval/time.Millisecond))
+	stopFeed := make(chan struct{})
+	defer close(stopFeed)
+	go func() {
+		// four short stalls per interval (10% in total), so every interval between two beats contains a stall:
+		// the second event of each pair blocks the receiver while the consumer is busy with the first
+		tick := time.NewTicker(interval / 4)
+		defer tick.Stop()
+		for seq := 2; ; seq += 2 {
+			select {
+			case <-stopFeed:
+				return
+			case <-tick.C:
+				sc.dispatch(seq, "MESSAGE_CREATE", `{}`)
+				sc.dispatch(seq+1, "MESSAGE_CREATE", `{}`)
+			}
+		}
+	}()
+
+	waitOp(t, sc, 1, 1) // never ACKed
+	firstBeat := time.Now()
+	sc2 := ss.d.await(t)
+	if d := time.Since(firstBeat); d > 4*interval {
+		t.Fatalf("zombie detected after %s; expected about 1.11 intervals of readable time", d)
+	}
+	_ = sc2
 }
 
 func TestLifecycle33_AckRacingWriteCompletion(t *testing.T) {
@@ -273,6 +324,71 @@ func TestLifecycle31_ConnectWhileStopping(t *testing.T) {
 	sc.dispatch(2, "RESUMED", `{}`)
 	if err := awaitErr(t, connected); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 46: dials that ignore their ctx (legacy proxies) use bounded resources: at most maxAbandonedDials are left
+// running, Disconnect returns promptly, attempts resume (and a later Connect works) once a slot frees up, and late
+// connections are closed without ever being used. If all of them stay stuck forever, no further dial is made.
+func TestLifecycle46_StalledDialsIgnoringCtx(t *testing.T) {
+	to := fastTimeouts()
+	to.dial = 50 * time.Millisecond
+	to.disconnect = 2 * time.Second
+	block := make(chan struct{})
+	var live, maxLive atomic.Int32
+	ss := newScriptShard(t, to, func(sc *scriptConn) {
+		sc.openBlock = block
+		sc.live, sc.maxLive = &live, &maxLive
+	}, nil)
+
+	connected := ss.connectAsync()
+	if !waitFor(10*time.Second, func() bool { return ss.d.count() == maxAbandonedDials }) {
+		t.Fatalf("expected the shard to keep attempting up to %d stuck dials, got %d", maxAbandonedDials, ss.d.count())
+	}
+	time.Sleep(20 * to.dial) // many more dial timeouts elapse
+	if n := ss.d.count(); n != maxAbandonedDials {
+		t.Fatalf("expected at most %d outstanding dials, got %d connection attempts", maxAbandonedDials, n)
+	}
+
+	start := time.Now()
+	if err := ss.c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect must not wait for abandoned dials: %v", err)
+	}
+	if d := time.Since(start); d > to.disconnect {
+		t.Fatalf("Disconnect took %s", d)
+	}
+	if err := awaitErr(t, connected); !errors.Is(err, ErrDisconnected) {
+		t.Fatalf("expected ErrDisconnected, got %v", err)
+	}
+
+	// a new run waits for a free dial slot instead of piling up more stuck dials
+	connected = ss.connectAsync()
+	time.Sleep(10 * to.dial)
+	if n := ss.d.count(); n != maxAbandonedDials {
+		t.Fatalf("a new run must wait for a free dial slot, got %d connection attempts", n)
+	}
+	var stuck []*scriptConn
+	for i := 0; i < maxAbandonedDials; i++ {
+		stuck = append(stuck, ss.d.await(t))
+	}
+	close(block) // the stuck dials complete late
+	sc := ss.d.await(t)
+	sc.hello(45000)
+	waitOp(t, sc, 2, 1)
+	sc.ready("sess-2")
+	if err := awaitErr(t, connected); err != nil {
+		t.Fatal(err)
+	}
+	for _, late := range stuck {
+		if !waitFor(5*time.Second, late.Disconnected) {
+			t.Fatalf("late connection %d was not closed", late.id)
+		}
+		if len(late.writes()) != 0 {
+			t.Fatalf("late connection %d was used", late.id)
+		}
+	}
+	if n := maxLive.Load(); n > maxAbandonedDials {
+		t.Fatalf("%d dials were running at once, the cap is %d", n, maxAbandonedDials)
 	}
 }
 
@@ -507,6 +623,161 @@ func saturate(c *EvtClient, stop chan struct{}, wg *sync.WaitGroup) {
 	}()
 }
 
+// 45 (and 38 without op 1): a short heartbeat interval with saturated user traffic never exceeds the outbound
+// limit and keeps the scheduled heartbeat cadence.
+func TestLifecycle45_ShortIntervalSaturated(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	to := fastTimeouts()
+	to.outboundWindow = 2 * time.Second
+	to.outboundLimit = 120
+
+	var rec frameRecorder
+	ss := newScriptShard(t, to, func(sc *scriptConn) {
+		sc.onWrite = func(sc *scriptConn, p *clientPacket) error {
+			rec.record(sc, p)
+			return ackHeartbeats(sc, p)
+		}
+	}, nil)
+	connectScripted(t, ss, int(interval/time.Millisecond))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	saturate(ss.c, stop, &wg)
+	time.Sleep(3 * to.outboundWindow)
+	close(stop)
+	wg.Wait()
+
+	if n := ss.d.count(); n != 1 {
+		t.Fatalf("saturation caused a reconnect (%d connections)", n)
+	}
+	frames := rec.of(0)
+	assertOutboundBudget(t, frames, to.outboundWindow, to.outboundLimit)
+
+	var last time.Time
+	var maxGap time.Duration
+	var commands int
+	for _, f := range frames {
+		if f.op == int(opcode.EventRequestGuildMembers) {
+			commands++
+		}
+		if f.op != int(opcode.EventHeartbeat) {
+			continue
+		}
+		if !last.IsZero() && f.at.Sub(last) > maxGap {
+			maxGap = f.at.Sub(last)
+		}
+		last = f.at
+	}
+	if maxGap > interval+interval/2 {
+		t.Fatalf("max heartbeat gap %s exceeds interval %s + slack", maxGap, interval)
+	}
+	if commands < 100 {
+		t.Fatalf("expected the user budget to be used, only %d commands sent", commands)
+	}
+}
+
+// 38: saturated user traffic plus op 1 spam: the outbound limit is never exceeded on any connection, and op 1
+// requests are answered or, once the hard limit is exhausted, the session reconnects (never silently ignored).
+func TestLifecycle38_Op1SpamRespondsOrReconnects(t *testing.T) {
+	const interval = 100 * time.Millisecond
+	to := fastTimeouts()
+	to.outboundWindow = 2 * time.Second
+	to.outboundLimit = 120
+
+	var rec frameRecorder
+	ss := newScriptShard(t, to, func(sc *scriptConn) {
+		sc.onWrite = func(sc *scriptConn, p *clientPacket) error {
+			rec.record(sc, p)
+			if p.Op == opcode.EventResume {
+				sc.dispatch(2, "RESUMED", `{}`)
+			}
+			return ackHeartbeats(sc, p)
+		}
+		if sc.id > 0 {
+			sc.hello(int(interval / time.Millisecond))
+		}
+	}, nil)
+	sc := connectScripted(t, ss, int(interval/time.Millisecond))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	saturate(ss.c, stop, &wg)
+	var requests atomic.Int32
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-sc.closed:
+				return
+			case <-tick.C:
+				requests.Inc()
+				sc.send(map[string]interface{}{"op": 1})
+			}
+		}
+	}()
+	time.Sleep(3 * to.outboundWindow)
+	close(stop)
+	wg.Wait()
+
+	for id := 0; id < ss.d.count(); id++ {
+		assertOutboundBudget(t, rec.of(id), to.outboundWindow, to.outboundLimit)
+	}
+	reconnected := ss.d.count() > 1
+	exhausted := ss.log.Count("a requested heartbeat can not be answered") > 0
+	var beats int
+	for _, f := range rec.of(0) {
+		if f.op == int(opcode.EventHeartbeat) {
+			beats++
+		}
+	}
+	switch {
+	case reconnected && !exhausted:
+		t.Fatalf("unexpected reconnect:\n%s", ss.log.Tail(20))
+	case !reconnected && beats < int(requests.Load())/10:
+		t.Fatalf("op 1 requests were not answered: %d requests, %d heartbeats", requests.Load(), beats)
+	}
+	t.Logf("op 1 requests=%d heartbeats on the first connection=%d reconnected=%v", requests.Load(), beats, reconnected)
+}
+
+// Item 7 of the review: an op 1 request is answered within the hard limit even when the control share is used up,
+// and reconnects (outboundExhausted) only when the hard limit is exhausted.
+func TestHeartbeatRequestUsesHardLimit(t *testing.T) {
+	newSession := func() (*session, *scriptConn) {
+		c := &EvtClient{log: newTestLogger("op1"), to: defaultTimeouts()}
+		s := c.newSession(nil)
+		sc := newScriptConn(0)
+		s.conn = sc
+		s.interval.Store(int64(time.Second))
+		return s, sc
+	}
+	fill := func(n int) *outboundBudget {
+		b := &outboundBudget{window: time.Minute}
+		for i := 0; i < n; i++ {
+			b.record(time.Now())
+		}
+		return b
+	}
+	_, control := outboundLimits(time.Second, time.Minute, 120)
+
+	s, sc := newSession()
+	if !s.sendHeartbeat(fill(control), false) || sc.countOp(1) != 1 {
+		t.Fatal("an op 1 request above the control share must still be answered")
+	}
+
+	s, sc = newSession()
+	if s.sendHeartbeat(fill(120), false) || sc.countOp(1) != 0 {
+		t.Fatal("an op 1 request at the hard limit must not be written")
+	}
+	if r := s.freeze(); r.kind != failOutboundExhausted {
+		t.Fatalf("expected the session to fail with outboundExhausted, got %s", r)
+	}
+}
+
 // Review item 6: READY/RESUMED end the handshake even if their sequence number is missing or not ahead of ours.
 func TestResumedWithStaleOrMissingSeq(t *testing.T) {
 	for _, tc := range []struct {
@@ -533,8 +804,8 @@ func TestResumedWithStaleOrMissingSeq(t *testing.T) {
 			sc2.hello(45000)
 			waitOp(t, sc2, 6, 1)
 			sc2.inbox <- []byte(tc.resumed)
-			if !waitFor(5*time.Second, func() bool { return ss.c.isConnected.Load() }) {
-				t.Fatal("RESUMED did not complete the handshake")
+			if !waitFor(5*time.Second, func() bool { return ss.c.stateSnapshot() == "ready" }) {
+				t.Fatalf("RESUMED did not complete the handshake, state %q", ss.c.stateSnapshot())
 			}
 			time.Sleep(5 * to.readyIdle)
 			if n := ss.d.count(); n != 2 {

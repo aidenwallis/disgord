@@ -87,6 +87,43 @@ func identifyFixture(t *testing.T, to *timeouts) (*scriptShard, *session, *scrip
 	return ss, s, sc, r
 }
 
+// Review item 4: an admitted identify turn is bounded before the writer accepted IDENTIFY, and a frame that was
+// not accepted is never written later.
+func TestIdentifyTurnBoundedBeforeAcceptance(t *testing.T) {
+	to := fastTimeouts()
+	to.write = 25 * time.Millisecond
+	to.outboundWindow = 2 * time.Second
+	to.outboundLimit = 10
+	ss, s, sc, r := identifyFixture(t, to)
+
+	// use up the control share with heartbeats requested by Discord just before the turn is granted
+	s.alive.writer.Store(true)
+	s.wgWork.Add(1)
+	go s.write()
+	_, controlLimit := outboundLimits(2*time.Second, to.outboundWindow, to.outboundLimit)
+	for i := 0; i < controlLimit; i++ {
+		s.beatNow <- struct{}{}
+		waitOp(t, sc, 1, i+1)
+	}
+
+	q := &identifyRequest{run: r, done: make(chan struct{})}
+	turnDone := make(chan error, 1)
+	go func() { turnDone <- ss.c.identifyTurn(q) }()
+	select {
+	case err := <-turnDone:
+		if !errors.Is(err, errIdentifyNotSent) {
+			t.Fatalf("expected errIdentifyNotSent, got %v", err)
+		}
+	case <-time.After(10 * to.write):
+		t.Fatal("the identify turn was not bounded before writer acceptance")
+	}
+
+	time.Sleep(to.outboundWindow + 200*time.Millisecond) // the budget frees up again
+	if n := sc.countOp(2); n != 0 {
+		t.Fatalf("an IDENTIFY that was not accepted must never be written, got %d", n)
+	}
+}
+
 // Review item 9: no IDENTIFY goes out once Disconnect cancelled the run, even before the session failed.
 func TestIdentifyTurnAfterRunCancelled(t *testing.T) {
 	ss, s, sc, r := identifyFixture(t, nil)

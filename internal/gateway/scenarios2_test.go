@@ -62,6 +62,47 @@ func assertDeliveredInOrder(t *testing.T, rc *testShard, want []string, timeout 
 	}
 }
 
+// 11 (A4, base: FAIL): a consumer blocked for 3+ heartbeat intervals causes no reconnect; heartbeats keep
+// flowing; every event is delivered in order; the shard reports degraded and recovers.
+func TestScenario11_BackPressure(t *testing.T) {
+	t.Parallel()
+	for _, stall := range []time.Duration{1500 * time.Millisecond, 4 * time.Second} {
+		stall := stall
+		t.Run(stall.String(), func(t *testing.T) {
+			t.Parallel()
+			gw := newScenario(t, 400)
+			rc := newTestShard(t, gw, shardOpts{})
+			fc := rc.connect(t)
+
+			rc.pause()
+			done := make(chan []string, 1)
+			go func() { done <- dispatchN(t, fc, "bp", 300) }()
+
+			if !waitFor(5*time.Second, func() bool { return strings.Contains(rc.c.stateSnapshot(), "degraded") }) {
+				t.Fatalf("expected degraded state while the consumer is blocked, got %q", rc.c.stateSnapshot())
+			}
+			hb := fc.heartbeats.Load()
+			time.Sleep(stall)
+			if fc.heartbeats.Load() <= hb {
+				t.Fatal("heartbeats must keep flowing while the consumer is blocked")
+			}
+			if gw.connCount() != 1 || fc.isClosed() {
+				t.Fatal("back-pressure must not cause a reconnect")
+			}
+			rc.resume()
+
+			assertDeliveredInOrder(t, rc, <-done, 20*time.Second)
+			if !waitFor(5*time.Second, func() bool { return rc.c.stateSnapshot() == "ready" }) {
+				t.Fatalf("expected ready after the consumer caught up, got %q", rc.c.stateSnapshot())
+			}
+			if gw.connCount() != 1 {
+				t.Fatalf("expected a single connection, got %d", gw.connCount())
+			}
+			rc.expectRecovery(t, 0, 10*time.Second)
+		})
+	}
+}
+
 // 12: teardown while the receiver is blocked on the event channel: the blocked event was not checkpointed, so
 // the RESUME replays it.
 func TestScenario12_BlockedEventRedeliveredAfterResume(t *testing.T) {
@@ -81,6 +122,35 @@ func TestScenario12_BlockedEventRedeliveredAfterResume(t *testing.T) {
 	rc.resume()
 	assertDeliveredInOrder(t, rc, want, 20*time.Second)
 	rc.expectRecovery(t, 1, 20*time.Second)
+}
+
+// 13: a RESUME replay that takes longer than readyIdle under back-pressure is not aborted (no abort loop).
+func TestScenario13_LongReplayUnderBackPressure(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 300)
+	to := fastTimeouts()
+	to.readyIdle = 300 * time.Millisecond
+	rc := newTestShard(t, gw, shardOpts{eventBuf: 1, timeouts: to})
+	fc := rc.connect(t)
+
+	rc.pause()
+	want := dispatchN(t, fc, "replay", 40)
+	time.Sleep(200 * time.Millisecond)
+	fc.abort(true)
+
+	if !waitFor(20*time.Second, func() bool { return gw.connCount() >= 2 && gw.conn(1).resumes.Load() == 1 }) {
+		t.Fatal("expected a RESUME on a new connection")
+	}
+	time.Sleep(10 * to.readyIdle) // the replay is stuck behind the blocked consumer
+	if n := gw.connCount(); n != 2 {
+		t.Fatalf("the RESUME was aborted while the consumer was blocked: %d connections", n)
+	}
+	rc.resume()
+	assertDeliveredInOrder(t, rc, want, 20*time.Second)
+	rc.expectRecovery(t, 1, 20*time.Second)
+	if n := gw.connCount(); n != 2 {
+		t.Fatalf("expected exactly 2 connections, got %d", n)
+	}
 }
 
 // 15: 20 rapid drops leave exactly one set of workers running.
@@ -106,7 +176,7 @@ func TestScenario15_RapidDropsNoLeak(t *testing.T) {
 }
 
 // 16 (C6): commands emitted while disconnected do not block, are sent only after RESUMED, and never trigger
-// 4003.
+// 4003; the outbound budget is never exceeded.
 func TestScenario16_CommandsWhileDisconnected(t *testing.T) {
 	t.Parallel()
 	gw := newScenario(t, 300)
@@ -150,6 +220,20 @@ func TestScenario16_CommandsWhileDisconnected(t *testing.T) {
 		}
 		if c.clientClose.Load() == 4003 {
 			t.Fatal("unexpected 4003")
+		}
+		assertOutboundBudget(t, c.frameLog(), rc.c.to.outboundWindow, rc.c.to.outboundLimit)
+	}
+}
+
+func assertOutboundBudget(t *testing.T, frames []frameRecord, window time.Duration, limit int) {
+	t.Helper()
+	for i := range frames {
+		n := 0
+		for j := i; j < len(frames) && frames[j].at.Sub(frames[i].at) < window; j++ {
+			n++
+		}
+		if n > limit {
+			t.Fatalf("%d frames within %s (limit %d)", n, window, limit)
 		}
 	}
 }

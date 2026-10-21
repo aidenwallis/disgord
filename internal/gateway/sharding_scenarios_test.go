@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -127,6 +128,38 @@ func TestManager_TwoShardsRecover(t *testing.T) {
 	conns[0].abort(true)
 	conns[1].closeWith(1001, "going away")
 	tm.checkProbes(tm.waitAll(minIdx, 3, 30*time.Second))
+}
+
+// S2 (A4, base: FAIL): slow consumer shared by 2 shards with the production event buffer.
+func TestManager_SlowConsumer(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	tm := newTestManager(t, gw, []uint{0, 1}, nil)
+	if err := tm.mngr.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	conns := tm.waitAll(0, 2, 20*time.Second)
+	tm.pause()
+	var wg sync.WaitGroup
+	for _, fc := range conns {
+		fc := fc
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				if err := fc.dispatch("MESSAGE_CREATE", []byte(fmt.Sprintf(`{"id":"s%d-%d"}`, fc.shardID.Load(), i))); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(4 * time.Second)
+	tm.resume()
+	wg.Wait()
+	tm.checkProbes(tm.waitAll(0, 3, 30*time.Second))
+	if n := gw.connCount(); n != 2 {
+		t.Fatalf("back-pressure must not cause reconnects, got %d connections", n)
+	}
 }
 
 // S3 (A1, base: FAIL): one shard's reconnect dies before HELLO; neither shard stays stuck.

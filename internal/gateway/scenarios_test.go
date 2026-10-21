@@ -6,6 +6,7 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,8 +126,8 @@ func TestScenario04_FatalCloseCodes(t *testing.T) {
 			if n := gw.dialAttempts.Load(); n != 1 {
 				t.Fatalf("expected no further dials after a fatal close, got %d", n)
 			}
-			if !shardStopped(rc.c) || rc.log.Count("ERROR") == 0 {
-				t.Fatal("expected the shard to stop and log an error")
+			if !strings.Contains(rc.c.stateSnapshot(), "stopped") || rc.log.Count("ERROR") == 0 {
+				t.Fatalf("expected stopped state and an error log, got %q", rc.c.stateSnapshot())
 			}
 		})
 	}
@@ -135,8 +136,8 @@ func TestScenario04_FatalCloseCodes(t *testing.T) {
 		rc := newTestShard(t, gw, shardOpts{})
 		fc := rc.connect(t)
 		fc.closeWith(4004, "Authentication failed.")
-		if !waitFor(10*time.Second, func() bool { return shardStopped(rc.c) }) {
-			t.Fatal("shard did not stop")
+		if !waitFor(10*time.Second, func() bool { return strings.Contains(rc.c.stateSnapshot(), "stopped") }) {
+			t.Fatalf("shard did not stop, state %q", rc.c.stateSnapshot())
 		}
 		time.Sleep(500 * time.Millisecond)
 		if n := gw.dialAttempts.Load(); n != 1 {

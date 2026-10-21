@@ -44,6 +44,7 @@ func TestPolicy(t *testing.T) {
 		{"op 7", failReason{kind: failReconnect}, phaseSession, retry},
 		{"zombie", failReason{kind: failZombie}, phaseSession, retry},
 		{"ready timeout", failReason{kind: failReadyTimeout}, phaseReady, retry},
+		{"outbound exhausted", failReason{kind: failOutboundExhausted}, phaseSession, retry},
 		{"op 9 d=true", failReason{kind: failInvalidSession, resumable: true}, phaseSession, invalidKeep},
 		{"op 9 d=false", failReason{kind: failInvalidSession}, phaseReady, invalidClear},
 		{"4007", remote(4007), phaseSession, invalidClear},
@@ -139,6 +140,73 @@ func TestEchoRule(t *testing.T) {
 	}
 }
 
+func TestReadableTime(t *testing.T) {
+	s := newTestSession()
+	base := time.Now()
+	mark := s.markAt(base)
+
+	s.stall.begin(base.Add(100 * time.Millisecond))
+	if got := s.readableSince(mark, base.Add(300*time.Millisecond)); got != 100*time.Millisecond {
+		t.Fatalf("an ongoing stall must not count as readable time, got %s", got)
+	}
+	s.stall.end(base.Add(400 * time.Millisecond))
+	if got := s.readableSince(mark, base.Add(500*time.Millisecond)); got != 200*time.Millisecond {
+		t.Fatalf("expected 200ms readable, got %s", got)
+	}
+	if got := s.stall.current(base.Add(500 * time.Millisecond)); got != 0 {
+		t.Fatalf("no stall in progress, got %s", got)
+	}
+
+	// heartbeat anchor stays at the oldest un-ACKed beat; with 10% stall per interval the zombie threshold is
+	// reached after about 1.11 intervals of wall time
+	interval := time.Second
+	s = newTestSession()
+	s.markBeat(base)
+	s.stall.begin(base.Add(900 * time.Millisecond))
+	s.stall.end(base.Add(interval))
+	s.markBeat(base.Add(interval)) // a second beat does not move the anchor
+	if s.isZombie(interval, base.Add(1050*time.Millisecond)) {
+		t.Fatal("not a zombie yet: only 0.95 intervals of readable time")
+	}
+	if !s.isZombie(interval, base.Add(1150*time.Millisecond)) {
+		t.Fatal("expected a zombie after 1.05 intervals of readable time")
+	}
+	s.onHeartbeatAck(base.Add(1150 * time.Millisecond))
+	if s.isZombie(interval, base.Add(10*interval)) {
+		t.Fatal("an ACK clears the outstanding heartbeat")
+	}
+}
+
+func TestOutboundBudget(t *testing.T) {
+	user, control := outboundLimits(41250*time.Millisecond, time.Minute, 120)
+	if user != 114 || control != 116 {
+		t.Fatalf("41.25s interval: expected user 114 / control 116, got %d / %d", user, control)
+	}
+	user, control = outboundLimits(2*time.Second, time.Minute, 120)
+	if user != 86 || control != 88 {
+		t.Fatalf("2s interval: expected user 86 / control 88, got %d / %d", user, control)
+	}
+
+	b := &outboundBudget{window: time.Minute}
+	base := time.Now()
+	for i := 0; i < 5; i++ {
+		b.record(base.Add(time.Duration(i) * time.Second))
+	}
+	now := base.Add(10 * time.Second)
+	if n := b.used(now); n != 5 {
+		t.Fatalf("expected 5 frames in the window, got %d", n)
+	}
+	if at := b.freeAt(now, 3); !at.Equal(base.Add(2*time.Second + time.Minute)) {
+		t.Fatalf("expected the budget to free up when the third oldest frame expires, got %s", at.Sub(base))
+	}
+	if at := b.freeAt(now, 10); !at.Equal(now) {
+		t.Fatal("budget available now")
+	}
+	if n := b.used(base.Add(time.Minute + 2*time.Second)); n != 2 {
+		t.Fatalf("expired frames must leave the window, got %d", n)
+	}
+}
+
 // nhooyr wrapper methods must not panic before Open succeeded (base: nil pointer dereference on Disconnect).
 func TestNhooyrWrapperNilSafe(t *testing.T) {
 	g := newSessionConn(nil, time.Second, time.Second)
@@ -182,7 +250,7 @@ func TestHeartbeatMarkedBeforeWrite(t *testing.T) {
 	s.conn = sc
 	s.interval.Store(int64(time.Second))
 
-	if !s.sendHeartbeat() {
+	if !s.sendHeartbeat(&outboundBudget{window: time.Minute}, true) {
 		t.Fatal("heartbeat write failed")
 	}
 	s.hb.mu.Lock()

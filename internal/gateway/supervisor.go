@@ -26,8 +26,8 @@ type timeouts struct {
 	hello            time.Duration
 	write            time.Duration
 	closeHandshake   time.Duration // absolute bound for the websocket close handshake
-	readyIdle        time.Duration // time without a dispatch frame while waiting for READY/RESUMED
-	readyCeiling     time.Duration // time from IDENTIFY to READY
+	readyIdle        time.Duration // readable time without a dispatch frame while waiting for READY/RESUMED
+	readyCeiling     time.Duration // readable time from IDENTIFY to READY
 	teardownJoinWarn time.Duration // error log cadence while waiting for session workers to retire
 	backoffMin       time.Duration
 	backoffMax       time.Duration
@@ -36,6 +36,9 @@ type timeouts struct {
 
 	invalidSessionMin time.Duration
 	invalidSessionMax time.Duration
+
+	outboundWindow time.Duration
+	outboundLimit  int
 }
 
 func defaultTimeouts() timeouts {
@@ -53,6 +56,8 @@ func defaultTimeouts() timeouts {
 		disconnect:        30 * time.Second,
 		invalidSessionMin: time.Second,
 		invalidSessionMax: 5 * time.Second,
+		outboundWindow:    60 * time.Second,
+		outboundLimit:     120,
 	}
 }
 
@@ -82,7 +87,78 @@ func (t timeouts) withDefaults() timeouts {
 	fill(&t.disconnect, d.disconnect)
 	fill(&t.invalidSessionMin, d.invalidSessionMin)
 	fill(&t.invalidSessionMax, d.invalidSessionMax)
+	fill(&t.outboundWindow, d.outboundWindow)
+	if t.outboundLimit <= 0 {
+		t.outboundLimit = d.outboundLimit
+	}
 	return t
+}
+
+// ---------------------------------------------------------------------------
+// shard state (observability)
+// ---------------------------------------------------------------------------
+
+type shardState int
+
+const (
+	stateIdle shardState = iota
+	stateConnecting
+	stateIdentifying
+	stateResuming
+	stateReady
+	stateBackoff
+	stateStopped
+)
+
+var shardStateNames = map[shardState]string{
+	stateIdle:        "idle",
+	stateConnecting:  "connecting",
+	stateIdentifying: "identifying",
+	stateResuming:    "resuming",
+	stateReady:       "ready",
+	stateBackoff:     "backoff",
+	stateStopped:     "stopped",
+}
+
+func (s shardState) String() string {
+	return shardStateNames[s]
+}
+
+func (c *EvtClient) setState(st shardState, reason string) {
+	c.mu.Lock()
+	prev, prevReason := c.state, c.stateReason
+	c.state, c.stateReason = st, reason
+	c.mu.Unlock()
+	if prev != st || prevReason != reason {
+		msg := fmt.Sprintf("state %s -> %s", prev, st)
+		if reason != "" {
+			msg += " (" + reason + ")"
+		}
+		c.log.Info(c.getLogPrefix(), msg)
+	}
+}
+
+// setDegraded flags back-pressure on the current session.
+func (c *EvtClient) setDegraded(s *session, degraded bool) {
+	c.mu.Lock()
+	if c.current == s {
+		c.degraded = degraded
+	}
+	c.mu.Unlock()
+}
+
+// stateSnapshot describes the shard, e.g. "ready", "ready (degraded: backpressure)", "stopped (4004 ...)".
+func (c *EvtClient) stateSnapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.state.String()
+	if c.stateReason != "" {
+		s += " (" + c.stateReason + ")"
+	}
+	if c.degraded {
+		s += " (degraded: backpressure)"
+	}
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -223,15 +299,18 @@ func (c *EvtClient) supervise(r *run) {
 		switch {
 		case act.stop:
 			r.sendFirst(ErrDisconnected)
+			c.setState(stateStopped, "disconnected")
 			return
 		case act.fatal:
 			err := newCloseError(out.reason.code)
 			c.log.Error(c.getLogPrefix(), "shard stopped permanently:", err)
+			c.setState(stateStopped, fmt.Sprintf("close code %d", out.reason.code))
 			r.sendFirst(err)
 			return
 		}
 		if r.ctx.Err() != nil {
 			r.sendFirst(ErrDisconnected)
+			c.setState(stateStopped, "disconnected")
 			return
 		}
 
@@ -253,16 +332,18 @@ func (c *EvtClient) supervise(r *run) {
 
 		c.log.Info(c.getLogPrefix(), fmt.Sprintf("connection attempt %d ended while %s: %s; next attempt in %s",
 			attempt, out.phase, out.reason, delay.Round(time.Millisecond)))
+		c.setState(stateBackoff, out.reason.String())
 		if !sleepCtx(r.ctx, delay) {
 			r.sendFirst(ErrDisconnected)
+			c.setState(stateStopped, "disconnected")
 			return
 		}
 	}
 }
 
 // retire runs when the supervisor exits. The run is only marked done once nothing it started can still touch
-// the shard state: workers are already joined by teardown. An abandoned dial may outlive the run; it only owns
-// (and closes) its unpublished connection.
+// the shard state: workers are already joined by teardown. Abandoned dials may outlive the run; they only own
+// (and close) their unpublished connection.
 func (c *EvtClient) retire(r *run) {
 	c.detachIdentify(r)
 	r.cancel()
@@ -322,7 +403,12 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 		out.reason = stopFailure
 		return out
 	}
+	if !c.awaitDialSlot(r) {
+		out.reason = stopFailure
+		return out
+	}
 
+	c.setState(stateConnecting, "")
 	conn, err := c.dial(r, c.evtConf.Endpoint)
 	if err != nil {
 		if r.ctx.Err() != nil {
@@ -337,6 +423,7 @@ func (c *EvtClient) attempt(r *run) (out outcome) {
 	sess.conn = conn
 	c.mu.Lock()
 	c.current = sess
+	c.degraded = false
 	c.mu.Unlock()
 
 	sess.alive.receiver.Store(true)
@@ -391,6 +478,7 @@ func (c *EvtClient) establish(r *run, sess *session, resumable bool) (out outcom
 	var err error
 	if resumable {
 		out.phase = phaseResume
+		c.setState(stateResuming, "")
 		c.mu.Lock()
 		pkt := &clientPacket{
 			Op:      opcode.EventResume,
@@ -401,6 +489,7 @@ func (c *EvtClient) establish(r *run, sess *session, resumable bool) (out outcom
 		err = sess.writeControl(pkt, c.to.writeAccept())
 	} else {
 		out.phase = phaseIdentify
+		c.setState(stateIdentifying, "")
 		err = c.awaitIdentify(r, sess)
 	}
 	if err != nil {
@@ -422,14 +511,15 @@ func (c *EvtClient) establish(r *run, sess *session, resumable bool) (out outcom
 	out.phase = phaseSession
 	sess.readyAtNano.Store(time.Now().UnixNano())
 	c.isConnected.Store(true)
+	c.setState(stateReady, "")
 	r.sendFirst(nil)
 	return out
 }
 
-// awaitReady waits for READY/RESUMED. It gives up when no dispatch frame arrived for readyIdle (a long RESUME
-// replay keeps making progress), or when READY took longer than readyCeiling after IDENTIFY.
+// awaitReady waits for READY/RESUMED with a progress-aware deadline on readable time, so a slow consumer (or a
+// long RESUME replay) never causes an abort loop.
 func (c *EvtClient) awaitReady(r *run, sess *session, identify bool) bool {
-	start := time.Now()
+	start := sess.markAt(time.Now())
 	sess.setProgress(start)
 
 	every := c.to.readyIdle / 20
@@ -453,11 +543,11 @@ func (c *EvtClient) awaitReady(r *run, sess *session, identify bool) bool {
 			return false
 		case <-tick.C:
 			now := time.Now()
-			if idle := now.Sub(sess.lastProgress()); idle >= c.to.readyIdle {
+			if idle := sess.readableSince(sess.lastProgress(), now); idle >= c.to.readyIdle {
 				sess.fail(failReason{kind: failReadyTimeout, err: fmt.Errorf("no dispatch for %s", idle.Round(time.Millisecond))})
 				return false
 			}
-			if identify && now.Sub(start) >= c.to.readyCeiling {
+			if identify && sess.readableSince(start, now) >= c.to.readyCeiling {
 				sess.fail(failReason{kind: failReadyTimeout, err: fmt.Errorf("no READY within %s", c.to.readyCeiling)})
 				return false
 			}
@@ -489,6 +579,7 @@ func (c *EvtClient) teardown(sess *session, closeCode int) failReason {
 	c.mu.Lock()
 	if c.current == sess {
 		c.current = nil
+		c.degraded = false
 	}
 	if c.identSess == sess {
 		c.identSess = nil
@@ -540,6 +631,10 @@ func (c *EvtClient) joinWorkers(sess *session) {
 // dialing
 // ---------------------------------------------------------------------------
 
+// maxAbandonedDials caps the Opens a shard gives up on that are still running, e.g. dials through a legacy proxy
+// that ignores its context. New attempts only wait once the cap is reached.
+const maxAbandonedDials = 4
+
 // dial opens a fresh connection. The helper goroutine owns the connection until it is handed over; if the
 // attempt gives up first, the helper closes a late connection itself and it is never published.
 func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
@@ -563,6 +658,13 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 			if err == nil {
 				_ = conn.CloseWithStatus(1000, "connection attempt abandoned")
 			}
+			c.mu.Lock()
+			c.abandonedDials--
+			if c.dialReturned != nil {
+				close(c.dialReturned)
+				c.dialReturned = nil
+			}
+			c.mu.Unlock()
 			return
 		}
 		delivered = true
@@ -576,6 +678,9 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 		mu.Lock()
 		if !delivered {
 			abandoned = true
+			c.mu.Lock()
+			c.abandonedDials++
+			c.mu.Unlock()
 			mu.Unlock()
 			if r.ctx.Err() != nil {
 				return nil, ErrDisconnected
@@ -589,6 +694,42 @@ func (c *EvtClient) dial(r *run, endpoint string) (sessionConn, error) {
 		return nil, err
 	}
 	return conn, nil
+}
+
+// awaitDialSlot waits, cancellable by the run, while maxAbandonedDials Opens are still outstanding.
+func (c *EvtClient) awaitDialSlot(r *run) bool {
+	var warn *time.Ticker
+	defer func() {
+		if warn != nil {
+			warn.Stop()
+		}
+	}()
+	for {
+		c.mu.Lock()
+		if c.abandonedDials < maxAbandonedDials {
+			c.mu.Unlock()
+			return true
+		}
+		if c.dialReturned == nil {
+			c.dialReturned = make(chan struct{})
+		}
+		returned := c.dialReturned
+		c.mu.Unlock()
+
+		var warnC <-chan time.Time
+		if warn == nil {
+			c.log.Error(c.getLogPrefix(), maxAbandonedDials, "websocket dials ignored their timeout and are still running; waiting before dialing again")
+			warn = time.NewTicker(c.to.teardownJoinWarn)
+		}
+		warnC = warn.C
+		select {
+		case <-returned:
+		case <-r.ctx.Done():
+			return false
+		case <-warnC:
+			c.log.Error(c.getLogPrefix(), "still waiting for abandoned websocket dials to return")
+		}
+	}
 }
 
 // awaitAdmissionWindow delays dialing when the built-in identify queue reports that IDENTIFY is not possible for
@@ -606,6 +747,7 @@ func (c *EvtClient) awaitAdmissionWindow(r *run) bool {
 		return true
 	}
 	c.log.Error(c.getLogPrefix(), "identify budget exhausted; delaying the connection by", delay.Round(time.Second))
+	c.setState(stateBackoff, "identify budget exhausted")
 	return sleepCtx(r.ctx, delay)
 }
 

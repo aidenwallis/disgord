@@ -16,17 +16,19 @@ const (
 	failInvalidSession // op 9
 	failZombie
 	failReadyTimeout
+	failOutboundExhausted
 	failStop // Disconnect or system shutdown
 )
 
 var failKindNames = map[failKind]string{
-	failTransport:      "transport",
-	failRemoteClose:    "remote close",
-	failReconnect:      "reconnect requested (op 7)",
-	failInvalidSession: "invalid session (op 9)",
-	failZombie:         "zombie connection (no heartbeat ACK)",
-	failReadyTimeout:   "no READY/RESUMED progress",
-	failStop:           "stopped",
+	failTransport:         "transport",
+	failRemoteClose:       "remote close",
+	failReconnect:         "reconnect requested (op 7)",
+	failInvalidSession:    "invalid session (op 9)",
+	failZombie:            "zombie connection (no heartbeat ACK)",
+	failReadyTimeout:      "no READY/RESUMED progress",
+	failOutboundExhausted: "outbound rate limit exhausted",
+	failStop:              "stopped",
 }
 
 // failReason describes why a session ended.
@@ -75,7 +77,7 @@ func (r failReason) rank() int {
 			return 4
 		}
 		return 3
-	case failReconnect, failZombie, failReadyTimeout:
+	case failReconnect, failZombie, failReadyTimeout, failOutboundExhausted:
 		return 3
 	default:
 		return 1
