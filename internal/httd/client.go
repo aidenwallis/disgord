@@ -32,6 +32,9 @@ const (
 	ContentType     = "Content-Type"
 	ContentTypeJSON = "application/json"
 	GZIPCompression = "gzip"
+
+	// DefaultRequestTimeout limits a request/response exchange when neither the caller nor Config sets a limit.
+	DefaultRequestTimeout = 2 * time.Minute
 )
 
 // Requester holds all the sub-request interface for Discord interaction
@@ -92,6 +95,7 @@ type Client struct {
 	httpClient                   HttpClientDoer
 	cancelRequestWhenRateLimited bool
 	buckets                      RESTBucketManager
+	requestTimeout               time.Duration // 0 => disabled
 }
 
 func (c *Client) BucketGrouping() (group map[string][]string) {
@@ -160,11 +164,22 @@ func NewClient(conf *Config) (*Client, error) {
 	}
 
 	return &Client{
-		url:        BaseURL + "/v" + strconv.Itoa(conf.APIVersion),
-		reqHeader:  header,
-		httpClient: conf.HttpClient,
-		buckets:    conf.RESTBucketManager,
+		url:            BaseURL + "/v" + strconv.Itoa(conf.APIVersion),
+		reqHeader:      header,
+		httpClient:     conf.HttpClient,
+		buckets:        conf.RESTBucketManager,
+		requestTimeout: requestTimeout(conf.RequestTimeout),
 	}, nil
+}
+
+func requestTimeout(configured time.Duration) time.Duration {
+	if configured == 0 {
+		return DefaultRequestTimeout
+	}
+	if configured < 0 {
+		return 0
+	}
+	return configured
 }
 
 // Config is the configuration options for the httd.Client structure. Essentially the behaviour of all requests
@@ -179,6 +194,11 @@ type Config struct {
 
 	// RESTBucketManager stores all rate limit buckets and dictates the behaviour of how rate limiting is respected
 	RESTBucketManager RESTBucketManager
+
+	// RequestTimeout limits the request/response exchange, including reading the response body, when the request
+	// context has no deadline. Waiting in the rate limit queue is not included.
+	// Zero means DefaultRequestTimeout, a negative value disables it.
+	RequestTimeout time.Duration
 
 	// Header field: `User-Agent: DiscordBot ({Source}, {Version}) {Extra}`
 	UserAgentVersion   string
@@ -260,7 +280,15 @@ func (c *Client) Do(ctx context.Context, r *Request) (resp *http.Response, body 
 	// queue & send request
 	c.buckets.Bucket(r.hashedEndpoint, func(bucket RESTBucket) {
 		resp, body, err = bucket.Transaction(ctx, func() (*http.Response, []byte, error) {
-			resp, err := c.httpClient.Do(req)
+			// the bucket is held until this returns, so a stalled exchange must not be able to hold it forever
+			exchange := req
+			if _, ok := ctx.Deadline(); !ok && c.requestTimeout > 0 {
+				exchangeCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+				defer cancel()
+				exchange = req.WithContext(exchangeCtx)
+			}
+
+			resp, err := c.httpClient.Do(exchange)
 			if err != nil {
 				return nil, nil, err
 			}
