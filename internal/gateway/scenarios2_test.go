@@ -289,6 +289,40 @@ func TestScenario17_CloseCodes(t *testing.T) {
 	})
 }
 
+// 19 (C4): RESUME dials resume_gateway_url with the base query parameters; after 2 pre-HELLO failures there
+// it falls back to the base URL (and still resumes).
+func TestScenario19_ResumeGatewayURL(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	gw.mu.Lock()
+	gw.resumeURL = gw.URL + "/resume"
+	gw.mu.Unlock()
+	rc := newTestShard(t, gw, shardOpts{endpoint: gw.URL + "/?v=10&encoding=json"})
+	fc := rc.connect(t)
+
+	fc.abort(true)
+	next := rc.expectRecovery(t, fc.idx+1, 20*time.Second)
+	if next.path != "/resume" || next.query != "v=10&encoding=json" || next.resumes.Load() != 1 {
+		t.Fatalf("expected RESUME via resume_gateway_url with base query, got path=%q query=%q resumes=%d",
+			next.path, next.query, next.resumes.Load())
+	}
+
+	gw.dropResumePath.Store(2)
+	next.abort(true)
+	fallback := rc.expectRecovery(t, next.idx+3, 20*time.Second)
+	if fallback.path != "/" || fallback.resumes.Load() != 1 {
+		t.Fatalf("expected a RESUME on the base URL after 2 failures, got path=%q resumes=%d", fallback.path, fallback.resumes.Load())
+	}
+	dials := gw.dialLog()
+	var paths []string
+	for _, d := range dials {
+		paths = append(paths, d.path)
+	}
+	if got := strings.Join(paths, ","); got != "/,/resume,/resume,/resume,/" {
+		t.Fatalf("unexpected dial sequence %s", got)
+	}
+}
+
 // 20: a READY -> close flapping loop keeps backing off and never re-identifies.
 func TestScenario20_FlappingBacksOff(t *testing.T) {
 	gw := newScenario(t, 500)
