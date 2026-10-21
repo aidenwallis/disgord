@@ -342,6 +342,14 @@ type Client struct {
 	shardManager gateway.ShardManager
 	eventChan    chan *gateway.Event
 
+	// Gateway().Disconnect may be retried or called concurrently, these close the shutdown channels exactly once
+	dispatcherShutdownOnce sync.Once
+	systemShutdownOnce     sync.Once
+
+	// gatewayStartupCancel is set (under mu) while Gateway().Connect discovers the gateway, so Disconnect can
+	// cancel a startup that has not published a shard manager yet
+	gatewayStartupCancel context.CancelFunc
+
 	connectedGuilds      []Snowflake
 	connectedGuildsMutex sync.RWMutex
 
@@ -380,7 +388,7 @@ func (c *Client) Pool() *pools {
 // heartbeat packet was sent. Note that heartbeats are usually sent around once a minute and is not a accurate
 // way to measure delay between the Client and Discord server
 func (c *Client) AvgHeartbeatLatency() (duration time.Duration, err error) {
-	latencies, err := c.shardManager.HeartbeatLatencies()
+	latencies, err := c.HeartbeatLatencies()
 	if err != nil {
 		return 0, err
 	}
@@ -396,7 +404,18 @@ func (c *Client) AvgHeartbeatLatency() (duration time.Duration, err error) {
 
 // HeartbeatLatencies returns latencies mapped to each shard, by their respective ID. shardID => latency.
 func (c *Client) HeartbeatLatencies() (latencies map[uint]time.Duration, err error) {
-	return c.shardManager.HeartbeatLatencies()
+	sharding := c.getShardManager()
+	if sharding == nil {
+		return nil, errors.New("not connected to the gateway")
+	}
+	return sharding.HeartbeatLatencies()
+}
+
+// getShardManager returns the shard manager published by Gateway().Connect, or nil before that.
+func (c *Client) getShardManager() gateway.ShardManager {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.shardManager
 }
 
 // GetConnectedGuilds get a list over guild IDs that this Client is "connected to"; or have joined through the ws connection. This will always hold the different Guild IDs, while the GetGuilds or GetCurrentUserGuilds might be affected by cache configuration.
