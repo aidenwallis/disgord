@@ -18,6 +18,15 @@ type Conn interface {
 	Disconnected() bool
 }
 
+// sessionConn is the transport of a single event client session. A fresh instance is created for every
+// connection attempt and is never shared between sessions.
+type sessionConn interface {
+	Conn
+
+	// CloseWithStatus performs the websocket close handshake using the given close code.
+	CloseWithStatus(code int, reason string) error
+}
+
 type CloseErr struct {
 	code int
 	info string

@@ -166,7 +166,8 @@ func createClient(ctx context.Context, conf *Config) (c *Client, err error) {
 	}
 
 	// websocket sharding
-	evtChan := make(chan *gateway.Event, 2) // TODO: higher value when more shards?
+	// shared by all shards; absorbs event bursts (eg. GUILD_CREATE on connect) without blocking the shards
+	evtChan := make(chan *gateway.Event, 256)
 
 	// event dispatcher
 	dispatch := newDispatcher()

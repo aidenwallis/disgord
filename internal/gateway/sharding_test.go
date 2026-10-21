@@ -166,22 +166,24 @@ func TestIdentifyRateLimiting(t *testing.T) {
 		Logger:       &logger.Empty{},
 	}
 	defer func() {
-		close(config.EventChan)
 		close(config.ShutdownChan)
 	}()
 
 	if err := ConfigureShardConfig(context.Background(), mock, &config.ShardConfig); err != nil {
 		t.Fatal(err)
 	}
+	// isolate the 24h budget from the identify spacing
+	config.ShardConfig.ShardRateLimit = time.Millisecond
 
 	mngr := NewShardMngr(config)
 	if err := mngr.initShards(); err != nil {
 		t.Fatal(err)
 	}
 
-	ts := time.Now().Add(20 * time.Hour)
+	// 999 identifies 20 hours ago: one more is allowed, the one after that must wait ~4 hours
+	ts := time.Now().Add(-20 * time.Hour)
 	reconnects := make([]time.Time, 0, DefaultIdentifyRateLimit+1)
-	for i := 1; i <= DefaultIdentifyRateLimit-2; i++ {
+	for i := 1; i <= DefaultIdentifyRateLimit-1; i++ {
 		reconnects = append(reconnects, ts)
 	}
 
@@ -190,15 +192,23 @@ func TestIdentifyRateLimiting(t *testing.T) {
 	mngr.sync.metric.Unlock()
 
 	nrOfTimestamps := mngr.sync.metric.ReconnectsSince(24 * time.Hour)
-	if nrOfTimestamps != DefaultIdentifyRateLimit-2 {
-		t.Fatalf("should be 998 reconnect time stamps, got %d", nrOfTimestamps)
+	if nrOfTimestamps != DefaultIdentifyRateLimit-1 {
+		t.Fatalf("should be 999 reconnect time stamps, got %d", nrOfTimestamps)
 	}
 
-	// the timeout is after a run execution, so we add a entry before the test case
-	mngr.connectQueue(0, func() error {
-		return nil
-	})
-	connected := make(chan interface{})
+	if err := mngr.connectQueue(0, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if n := mngr.sync.metric.ReconnectsSince(24 * time.Hour); n != DefaultIdentifyRateLimit {
+		t.Fatalf("the identify should have been charged, got %d identifies", n)
+	}
+
+	eta := mngr.sync.admissionETA()
+	if eta < 3*time.Hour+59*time.Minute || eta > 4*time.Hour {
+		t.Fatalf("expected the next identify to be admitted in ~4h, got %s", eta)
+	}
+
+	connected := make(chan interface{}, 1)
 	go mngr.connectQueue(0, func() error {
 		connected <- true
 		return nil
@@ -207,16 +217,6 @@ func TestIdentifyRateLimiting(t *testing.T) {
 	select {
 	case <-connected:
 		t.Fatal("should not be able to connect")
-	case <-time.After(100 * time.Millisecond): // TODO: remove timeout, just don't know how yet
-		select {
-		case item, ok := <-mngr.sync.queue:
-			if !ok {
-				t.Fatal("queue was closed somehow")
-			}
-			if item == nil {
-				t.Fatal("expected item to not be nil")
-			}
-		default:
-		}
+	case <-time.After(200 * time.Millisecond):
 	}
 }

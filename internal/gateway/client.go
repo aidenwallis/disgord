@@ -41,7 +41,7 @@ type connectQueue = func(shardID uint, cb func() error) error
 type connectSignature = func() (evt interface{}, err error)
 type discordErrListener = func(code int, reason string)
 
-// newClient ...
+// newClient creates the legacy (voice-only) client.
 func newClient(shardID uint, conf *config, connect connectSignature) (c *client, err error) {
 	var ws Conn
 	if conf.conn == nil {
@@ -106,6 +106,10 @@ type config struct {
 	SystemShutdown chan interface{}
 }
 
+// client is the LEGACY connection lifecycle, used by the VoiceClient only. The event client (EvtClient) has its
+// own supervisor/session lifecycle (supervisor.go, session.go) and must not use anything in this file: the
+// receiver/emitter/pulsate/reconnect machinery below shares state across connections and can wedge.
+//
 // client can be used as a base for other ws clients; voice, event. Note the use of
 // client.ReleasePermit() and client.RequestPermit() in Connect (and then automatically reconnect()).
 // these are used for synchronizing connecting and you must therefore correctly release the permit once you have
@@ -129,7 +133,7 @@ type client struct {
 	ShardID uint
 
 	// sending and receiving data
-	ratelimit        ratelimiter
+	ratelimit        *ratelimiter
 	receiveChan      chan *DiscordPacket
 	internalEmitChan chan *clientPacket
 	emitChan         chan *clientPacket
@@ -418,7 +422,7 @@ func (c *client) emitter(ctx context.Context) {
 	write := func(msg *clientPacket) error {
 		// save to file
 		// build tag: disgord_diagnosews
-		saveOutgoingPacket(c, msg)
+		saveOutgoingPacket(c.log, c.getLogPrefix(), c.clientType, c.ShardID, msg)
 
 		if err := c.conn.WriteJSON(msg); err != nil {
 			once.Do(cancel)
@@ -441,10 +445,14 @@ func (c *client) emitter(ctx context.Context) {
 			go c.reconnect()
 			return
 		case <-time.After(300 * time.Millisecond): // TODO: don't use fixed timeout
-			if !c.messageQueue.IsEmpty() {
-				// try to write the message
-				// on failure the message is put back into the queue
-				err = c.messageQueue.Try(write)
+			// try to write the message
+			// on failure the message is put back into the queue
+			if msg := c.messageQueue.Begin(); msg != nil {
+				if err = write(msg); err != nil {
+					c.messageQueue.Rollback(msg)
+				} else {
+					c.messageQueue.Commit(msg)
+				}
 			}
 		case msg, open := <-c.internalEmitChan:
 			if !open {
@@ -481,6 +489,7 @@ func (c *client) receiver(ctx context.Context) {
 	var noopCounter int
 
 	internal, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	once := sync.Once{}
 
 	for {
@@ -593,7 +602,7 @@ func (c *client) receiver(ctx context.Context) {
 
 		// save to file
 		// build tag: disgord_diagnosews
-		saveIncomingPacker(c, evt, packet)
+		saveIncomingPacker(c.log, c.getLogPrefix(), c.clientType, c.ShardID, evt, packet)
 
 		// notify listeners
 		c.receiveChan <- evt

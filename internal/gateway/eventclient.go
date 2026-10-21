@@ -1,10 +1,8 @@
 package gateway
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"runtime"
 	"sync"
@@ -15,43 +13,63 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/aidenwallis/disgord/internal/gateway/cmd"
-	"github.com/aidenwallis/disgord/internal/gateway/event"
 	"github.com/aidenwallis/disgord/internal/gateway/opcode"
 	"github.com/aidenwallis/disgord/internal/logger"
 )
 
-// NewManager creates a new socket client manager for handling behavior and Discord events. Note that this
-// function initiates a go routine.
+// NewEventClient creates a new socket client for handling behavior and Discord events. Connections are managed
+// by a supervisor goroutine started by Connect.
 func NewEventClient(shardID uint, conf *EvtConfig) (client *EvtClient, err error) {
 	conf.validate()
 
-	var eChan chan<- *Event
-	if conf.EventChan != nil {
-		eChan = conf.EventChan
-	} else {
-		err = errors.New("missing event channel")
-		return nil, err
+	if conf.EventChan == nil {
+		return nil, errors.New("missing event channel")
+	}
+	if conf.Logger == nil {
+		conf.Logger = logger.Empty{}
 	}
 
 	conf.Logger.Debug(fmt.Sprintf("shard{%d} intents(%d): %s", shardID, conf.Intents, conf.Intents.String()))
 
+	to := defaultTimeouts()
+	if conf.timeouts != nil {
+		to = conf.timeouts.withDefaults()
+	}
+
+	queueLimit := int(conf.MessageQueueLimit)
+	if queueLimit == 0 {
+		queueLimit = 20
+	}
+
+	pool := conf.DiscordPktPool
+	if pool == nil {
+		pool = &sync.Pool{New: func() interface{} { return &DiscordPacket{} }}
+	}
+
 	client = &EvtClient{
-		evtConf:   conf,
-		eventChan: eChan,
+		evtConf:      conf,
+		ShardID:      shardID,
+		log:          conf.Logger,
+		to:           to,
+		eventChan:    conf.EventChan,
+		shutdown:     conf.SystemShutdown,
+		connectQueue: conf.connectQueue,
+		identifySync: conf.identifySync,
+		ratelimit:    newRatelimiter(),
+		messageQueue: newClientPktQueue(queueLimit),
+		cmdSignal:    make(chan struct{}, 1),
+		pktPool:      pool,
+		newConn:      conf.newConn,
 	}
-	client.client, err = newClient(shardID, &config{
-		Logger:            conf.Logger,
-		Endpoint:          conf.Endpoint,
-		DiscordPktPool:    conf.DiscordPktPool,
-		HTTPClient:        conf.HTTPClient,
-		conn:              conf.conn,
-		messageQueueLimit: conf.MessageQueueLimit,
-		SystemShutdown:    conf.SystemShutdown,
-	}, client.internalConnect)
-	if err != nil {
-		return nil, err
+	if client.connectQueue == nil {
+		client.connectQueue = func(_ uint, cb func() error) error { return cb() }
 	}
-	client.setupBehaviors()
+	if client.newConn == nil {
+		httpClient, writeTimeout, closeTimeout := conf.HTTPClient, to.write, to.closeHandshake
+		client.newConn = func() (sessionConn, error) {
+			return newSessionConn(httpClient, writeTimeout, closeTimeout), nil
+		}
+	}
 
 	client.identity = &evtIdentity{
 		Token: conf.BotToken,
@@ -70,7 +88,7 @@ func NewEventClient(shardID uint, conf *EvtConfig) (client *EvtClient, err error
 		}
 	}
 
-	return
+	return client, nil
 }
 
 // Event is dispatched by the socket layer after parsing and extracting Discord data from a incoming packet.
@@ -87,8 +105,11 @@ type EvtConfig struct {
 	BotToken   string
 	HTTPClient *http.Client
 
-	// for testing only
-	conn Conn
+	// newConn creates the transport for every new connection; defaults to nhooyr over HTTPClient
+	newConn func() (sessionConn, error)
+
+	// timeouts overrides the per-client timeouts; zero fields keep their default
+	timeouts *timeouts
 
 	Intents Intent
 
@@ -97,7 +118,11 @@ type EvtConfig struct {
 	EventChan chan<- *Event
 
 	connectQueue connectQueue
+	// identifySync is set when connectQueue is the built-in shardSync, which can skip abandoned identifies
+	identifySync *shardSync
 
+	// discordErrListener is not invoked by the event client: the shard manager's autoscaling listener would
+	// deadlock (see ShardConfig.OnScalingRequired).
 	discordErrListener discordErrListener
 
 	Presence *UpdateStatusPayload
@@ -137,22 +162,66 @@ func (conf *EvtConfig) validate() {
 	}
 }
 
+// EvtClient is one gateway shard.
+//
+// Lock order: shardMngr.mu -> lifecycleMu -> mu -> identifyRequest.mu. The receiver never holds mu while
+// sending on the event channel.
 type EvtClient struct {
 	evtConf *EvtConfig
-
-	*client
-	ReadyCounter uint
+	ShardID uint
+	log     logger.Logger
+	to      timeouts
 
 	eventChan    chan<- *Event
+	shutdown     <-chan interface{}
 	ignoreEvents []string
+	pktPool      *sync.Pool
+	newConn      func() (sessionConn, error)
 
-	sessionID      string
-	sequenceNumber atomic.Uint32
+	connectQueue connectQueue
+	identifySync *shardSync
 
-	rdyPool *sync.Pool
+	ratelimit    *ratelimiter
+	messageQueue clientPktQueue
+	cmdSignal    chan struct{} // buffered(1): a command was queued
 
 	identity *evtIdentity
 	idMu     sync.RWMutex
+
+	// lifecycle: at most one run (supervisor) exists; it is only cleared by the supervisor itself
+	lifecycleMu         sync.Mutex
+	run                 *run
+	requestedDisconnect atomic.Bool
+	haveConnectedOnce   atomic.Bool
+	isConnected         atomic.Bool
+
+	runCounter     atomic.Uint64
+	sessionCounter atomic.Uint64
+	logSequence    atomic.Uint32 // ARM 32bit causes panic with 64bit
+	lastFrameAt    atomic.Int64
+
+	// mu guards the shared shard state below. Sessions only mutate it while they are current.
+	mu             sync.Mutex
+	current        *session
+	identSess      *session // current session waiting for its identify turn
+	identReq       *identifyRequest
+	abandonedDials int           // Opens given up on that have not returned yet
+	dialReturned   chan struct{} // closed (and replaced) whenever an abandoned Open returns
+	sessionID      string
+	seq            uint32
+	hasSeq         bool
+	latency        time.Duration
+	state          shardState
+	stateReason    string
+	degraded       bool
+	ReadyCounter   uint
+}
+
+var _ Link = (*EvtClient)(nil)
+
+func (c *EvtClient) getLogPrefix() string {
+	nr := c.logSequence.Add(1)
+	return fmt.Sprintf("[ws-e,s:%d,shard:%d]", nr, c.ShardID)
 }
 
 func (c *EvtClient) SetPresence(data interface{}) (err error) {
@@ -168,283 +237,64 @@ func (c *EvtClient) SetPresence(data interface{}) (err error) {
 	return nil
 }
 
+// Emit queues a gateway command. Commands are sent once the shard is (re)connected and READY/RESUMED.
 func (c *EvtClient) Emit(command string, data CmdPayload) (err error) {
 	if command == cmd.UpdateStatus {
 		if err = c.SetPresence(data); err != nil {
 			return err
 		}
 	}
-	return c.client.queueRequest(command, data)
+	return c.queueRequest(command, data)
 }
 
-//////////////////////////////////////////////////////
-//
-// BEHAVIORS
-//
-//////////////////////////////////////////////////////
-
-func (c *EvtClient) setupBehaviors() {
-	// operation handlers
-	c.addBehavior(&behavior{
-		addresses: discordOperations,
-		actions: behaviorActions{
-			opcode.EventDiscordEvent:   c.onDiscordEvent,
-			opcode.EventHeartbeat:      c.onHeartbeatRequest,
-			opcode.EventHeartbeatAck:   c.onHeartbeatAck,
-			opcode.EventHello:          c.onHello,
-			opcode.EventInvalidSession: c.onSessionInvalidated,
-			opcode.EventReconnect: func(i interface{}) error {
-				c.log.Info(c.getLogPrefix(), "Discord requested a reconnect")
-				// There might be duplicate EventReconnect requests from Discord
-				// this is therefore a goroutine such that reconnect requests that takes
-				// place at the same time as the current one is discarded
-				go c.reconnect()
-				return nil
-			},
-		},
-	})
-
-	c.addBehavior(&behavior{
-		addresses: heartbeating,
-		actions: behaviorActions{
-			sendHeartbeat: c.sendHeartbeat,
-		},
-	})
-}
-
-//////////////////////////////////////////////////////
-//
-// BEHAVIOR: Discord Operations & helpers
-//
-//////////////////////////////////////////////////////
-
-func (c *EvtClient) synchronizeSnr(p *DiscordPacket) (err error) {
-	c.Lock()
-	defer c.Unlock()
-
-	// validate the sequence numbers
-	// ws/tcp only
-	if p.SequenceNumber != c.sequenceNumber.Load()+1 {
-		go c.reconnect()
-
-		err = fmt.Errorf("websocket sequence numbers missmatch, forcing reconnect. Got %d, wants %d", p.SequenceNumber, c.sequenceNumber.Load()+1)
-		return
+func (c *EvtClient) queueRequest(command string, data CmdPayload) (err error) {
+	if !c.haveConnectedOnce.Load() {
+		return errors.New("race condition detected: you must Connect to the socket API/Gateway before you can send gateway commands: " + command)
 	}
 
-	// increment the sequence number for each event to make sure everything is synced with discord
-	c.sequenceNumber.Inc()
-	return nil
-}
-
-func (c *EvtClient) virginConnection() bool {
-	return c.sessionID == "" && c.sequenceNumber.Load() == 0
-}
-
-func (c *EvtClient) onReady(v interface{}) (err error) {
-	p := v.(*DiscordPacket)
-
-	// always store the session id
-	ready := evtReadyPacket{}
-	if err = json.Unmarshal(p.Data, &ready); err != nil {
-		return err
+	op := CmdNameToOpCode(command, clientTypeEvent)
+	if op == opcode.None {
+		return errors.New("unsupported command: " + command)
 	}
 
-	c.Lock()
-	c.sessionID = ready.SessionID
-	c.ReadyCounter++
-	c.Unlock()
-
-	//if ch := c.onceChannels.Acquire(opcode.EventReadyResumed); ch != nil {
-	//	ch <- ready
-	//}
-
-	return nil
-}
-
-func (c *EvtClient) onDiscordEvent(v interface{}) (err error) {
-	p := v.(*DiscordPacket)
-
-	if err = c.synchronizeSnr(p); err != nil {
-		return
+	p := &clientPacket{
+		Op:      op,
+		Data:    data,
+		CmdName: command,
 	}
-
-	if p.EventName == event.Ready {
-		if err = c.onReady(p); err != nil {
-			return err
+	if accepted := c.ratelimit.Request(command); !accepted {
+		// we might be rate limited.. but lets see if there is another
+		// presence update in the queue; then it can be overwritten
+		if err := c.messageQueue.AddByOverwrite(p); err != nil {
+			return errors.New("rate limited")
 		}
-	}
-	//} else if p.EventName == event.Resumed {
-	//	if ch := c.onceChannels.Acquire(opcode.EventReadyResumed); ch != nil {
-	//		// WARNING! does not return a ready event on resume!
-	//		// TODO: clean up
-	//		ch <- event.Resumed
-	//	}
-	//}
-
-	if !c.eventOfInterest(p.EventName) {
+		c.signalCommands()
 		return nil
 	}
-
-	// dispatch event through out the Disgord system
-	c.eventChan <- &Event{
-		Name:    p.EventName,
-		Data:    p.Data,
-		ShardID: c.ShardID,
-	}
-
-	return nil
-} // end onDiscordEvent
-
-func (c *EvtClient) onHeartbeatRequest(v interface{}) error {
-	return c.sendHeartbeat(v)
-}
-
-func (c *EvtClient) onHeartbeatAck(v interface{}) error {
-	c.Lock()
-	c.lastHeartbeatAck = time.Now()
-	c.Unlock()
-
-	return nil
-}
-
-func (c *EvtClient) onHello(v interface{}) error {
-	p := v.(*DiscordPacket)
-
-	helloPk := &helloPacket{}
-	if err := json.Unmarshal(p.Data, helloPk); err != nil {
+	if err = c.messageQueue.Add(p); err != nil {
 		return err
 	}
-
-	c.Lock()
-	c.heartbeatInterval = helloPk.HeartbeatInterval
-	c.Unlock()
-
-	c.activateHeartbeats <- true
-
-	// if this is a new connection we can drop the resume packet
-	if c.virginConnection() {
-		return sendIdentityPacket(false, c)
-	}
-
-	c.sendHelloPacket()
+	c.signalCommands()
 	return nil
 }
 
-func (c *EvtClient) onSessionInvalidated(v interface{}) error {
-	// invalid session. Must respond with a identify packet
-	c.log.Info(c.getLogPrefix(), "Discord invalidated session")
-
-	// session is invalidated, reset the sequence number
-	c.sequenceNumber.Store(0)
-
-	rand.Seed(time.Now().UnixNano())
-	delay := rand.Intn(4) + 1
-	delay *= c.timeoutMultiplier
-	randomDelay := time.Second * time.Duration(delay)
-
-	// This ignores the identify rate limit of 1/5s, because of the documentation stating:
-	//  It's also possible that your client cannot reconnect in time to resume, in which case
-	//  the client will receive a Opcode 9 Invalid Session and is expected to wait a random
-	//  amount of time—between 1 and 5 seconds—then send a fresh Opcode 2 EventIdentify.
+func (c *EvtClient) signalCommands() {
 	select {
-	case <-time.After(randomDelay):
-	case <-c.SystemShutdown:
-		return errors.New("system is shutting down")
+	case c.cmdSignal <- struct{}{}:
+	default:
 	}
-
-	return sendIdentityPacket(true, c)
 }
 
-//////////////////////////////////////////////////////
-//
-// BEHAVIOR: heartbeat
-//
-//////////////////////////////////////////////////////
+// HeartbeatLatency get the time diff between sending a heartbeat and Discord replying with a heartbeat ack
+func (c *EvtClient) HeartbeatLatency() (duration time.Duration, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-func (c *EvtClient) sendHeartbeat(i interface{}) error {
-	c.RLock()
-	snr := c.sequenceNumber
-	c.RUnlock()
-
-	return c.emit(event.Heartbeat, snr)
-}
-
-// ////////////////////////////////////////////////////
-//
-// GENERAL: unique to event
-//
-// ////////////////////////////////////////////////////
-func (c *EvtClient) Connect() (err error) {
-	_, err = c.internalConnect()
+	duration = c.latency
+	if duration == 0 {
+		err = errors.New("latency not determined yet")
+	}
 	return
-}
-
-func (c *EvtClient) internalConnect() (evt interface{}, err error) {
-	if c.isConnected.Load() {
-		err = errors.New("cannot Connect while a connection already exist")
-		return nil, err
-	}
-
-	if c.conf.Endpoint == "" {
-		err = errors.New("missing websocket endpoint. Must be set before constructing the sockets")
-		return nil, err
-	}
-
-	var sessionCtx context.Context
-	sessionCtx, c.cancel = context.WithCancel(context.Background())
-
-	err = c.evtConf.connectQueue(c.ShardID, func() error {
-		sentIdentifyResume := make(chan interface{})
-		c.onceChannels.Add(opcode.EventIdentify, sentIdentifyResume)
-		c.onceChannels.Add(opcode.EventResume, sentIdentifyResume)
-		defer func() {
-			// cleanup once channels
-			c.onceChannels.Acquire(opcode.EventIdentify)
-			c.onceChannels.Acquire(opcode.EventResume)
-		}()
-
-		if err := c.openConnection(sessionCtx); err != nil {
-			return err
-		}
-
-		c.log.Debug(c.getLogPrefix(), "waiting to send identify/resume")
-		select {
-		case <-sessionCtx.Done():
-			c.log.Info(c.getLogPrefix(), "session context was closed")
-		case <-sentIdentifyResume:
-			c.log.Debug(c.getLogPrefix(), "sent identify/resume")
-		case <-time.After(3 * time.Minute):
-			c.log.Error(c.getLogPrefix(), "discord timeout during connect (3 minutes). No idea what went wrong..")
-			go c.reconnect()
-			return errors.New("websocket connected but was not able to send identify packet within 3 minutes")
-		}
-		return nil
-	})
-	return nil, err
-}
-
-func (c *EvtClient) openConnection(ctx context.Context) error {
-	// establish ws connection
-	if err := c.conn.Open(ctx, c.conf.Endpoint, nil); err != nil {
-		return err
-	}
-
-	// we can now interact with Discord
-	c.haveConnectedOnce.Store(true)
-	c.isConnected.Store(true)
-	go c.receiver(ctx)
-	go c.emitter(ctx)
-	go c.startBehaviors(ctx)
-	go c.prepareHeartbeating(ctx)
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-c.SystemShutdown:
-			_ = c.Disconnect()
-		}
-	}()
-
-	return nil
 }
 
 func (c *EvtClient) eventOfInterest(name string) bool {
@@ -455,42 +305,3 @@ func (c *EvtClient) eventOfInterest(name string) bool {
 	}
 	return true
 }
-
-func (c *EvtClient) sendHelloPacket() {
-	c.RLock()
-	token := c.evtConf.BotToken
-	session := c.sessionID
-	c.RUnlock()
-	sequence := c.sequenceNumber.Load()
-
-	err := c.emit(event.Resume, &evtResume{token, session, sequence})
-	if err != nil {
-		c.log.Error(c.getLogPrefix(), err)
-	}
-
-	c.log.Debug(c.getLogPrefix(), "sendHelloPacket is acquiring once channel")
-	channel := c.onceChannels.Acquire(opcode.EventResume)
-	c.log.Debug(c.getLogPrefix(), "writing to once channel", channel)
-	channel <- true
-	c.log.Debug(c.getLogPrefix(), "finished writing to once channel", channel)
-}
-
-func sendIdentityPacket(invalidSession bool, c *EvtClient) (err error) {
-	c.idMu.RLock()
-	var id = &evtIdentity{} // TODO: read only?
-	*id = *c.identity
-	// copy it to avoid data race
-	c.idMu.RUnlock()
-	err = c.emit(event.Identify, id)
-
-	if !invalidSession {
-		c.log.Debug(c.getLogPrefix(), "sendIdentityPacket is acquiring once channel")
-		channel := c.onceChannels.Acquire(opcode.EventIdentify)
-		c.log.Debug(c.getLogPrefix(), "writing to once channel", channel)
-		channel <- true
-		c.log.Debug(c.getLogPrefix(), "finished writing to once channel", channel)
-	}
-	return
-}
-
-var _ Link = (*EvtClient)(nil)
