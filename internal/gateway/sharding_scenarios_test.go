@@ -4,7 +4,9 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -208,6 +210,132 @@ func TestManager14_HangingUpgradeDoesNotBlockOtherShard(t *testing.T) {
 	tm.checkProbes(tm.waitAll(minIdx, 2, 30*time.Second))
 }
 
+// 26: three shards start concurrently; one fatal close at startup stops all of them and Connect returns it.
+func TestManager26_FatalAtStartup(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	gw.mu.Lock()
+	gw.identifyCloseShard[1] = 4004
+	gw.mu.Unlock()
+	tm := newTestManager(t, gw, []uint{0, 1, 2}, nil)
+	err := tm.mngr.Connect()
+	var closeErr *GatewayCloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != 4004 {
+		t.Fatalf("expected the fatal close code from shard 1, got %v", err)
+	}
+	if ids := tm.running(); len(ids) != 0 {
+		t.Fatalf("every shard must be stopped after a failed startup, running: %v", ids)
+	}
+	dials := gw.dialAttempts.Load()
+	time.Sleep(500 * time.Millisecond)
+	if n := gw.dialAttempts.Load(); n != dials || openConns(gw) != 0 {
+		t.Fatalf("no shard may connect after a failed startup (dials %d -> %d, open conns %d)", dials, n, openConns(gw))
+	}
+
+	// the manager can be connected again
+	if err := tm.mngr.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	tm.checkProbes(tm.waitAll(int(gw.connCount())-3, 1, 30*time.Second))
+}
+
+func TestManager26_DisconnectDuringStartup(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	release := make(chan struct{})
+	queue := func(_ uint, cb func() error) error {
+		<-release
+		return cb()
+	}
+	tm := newTestManager(t, gw, []uint{0, 1, 2}, func(conf *ShardManagerConfig) { conf.ConnectQueue = queue })
+	errCh := make(chan error, 1)
+	go func() { errCh <- tm.mngr.Connect() }()
+	if !waitFor(10*time.Second, func() bool { return gw.connCount() == 3 }) {
+		t.Fatal("shards did not dial")
+	}
+	if err := tm.mngr.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; !errors.Is(err, ErrDisconnected) {
+		t.Fatalf("expected ErrDisconnected, got %v", err)
+	}
+	close(release)
+	dials := gw.dialAttempts.Load()
+	time.Sleep(500 * time.Millisecond)
+	if n := gw.dialAttempts.Load(); n != dials || gw.totalIdentifies() != 0 {
+		t.Fatalf("no shard may start after Disconnect (dials %d -> %d, identifies %d)", dials, n, gw.totalIdentifies())
+	}
+	if ids := tm.running(); len(ids) != 0 {
+		t.Fatalf("shards still running: %v", ids)
+	}
+}
+
+// 35: Disconnect racing Connect never leaves a shard running without a manager run.
+func TestManager35_DisconnectRacingRegistration(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	tm := newTestManager(t, gw, []uint{0, 1, 2}, nil)
+	for i := 0; i < 10; i++ {
+		connectErr := make(chan error, 1)
+		go func() { connectErr <- tm.mngr.Connect() }()
+		time.Sleep(time.Duration(i) * 5 * time.Millisecond)
+		if err := tm.mngr.Disconnect(); err != nil {
+			t.Fatal(err)
+		}
+		err := <-connectErr
+		if err == nil {
+			// Disconnect ran before the registration; stop the started run
+			if err := tm.mngr.Disconnect(); err != nil {
+				t.Fatal(err)
+			}
+		} else if !errors.Is(err, ErrDisconnected) && !errors.Is(err, ErrStopping) {
+			t.Fatalf("iteration %d: unexpected Connect error %v", i, err)
+		}
+		if ids := tm.running(); len(ids) != 0 {
+			t.Fatalf("iteration %d: shards running after Disconnect: %v", i, ids)
+		}
+		tm.mngr.mu.RLock()
+		m := tm.mngr.mrun
+		tm.mngr.mu.RUnlock()
+		if m != nil {
+			t.Fatalf("iteration %d: manager run not cleared after Disconnect", i)
+		}
+	}
+}
+
+// 35: a shard that became READY and then stopped while another shard is still starting fails the startup.
+func TestManager35_ReadyThenFatalWhileOthersStart(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	releaseShard1 := make(chan struct{})
+	queue := func(shardID uint, cb func() error) error {
+		if shardID == 1 {
+			<-releaseShard1
+		}
+		return cb()
+	}
+	tm := newTestManager(t, gw, []uint{0, 1}, func(conf *ShardManagerConfig) { conf.ConnectQueue = queue })
+	errCh := make(chan error, 1)
+	go func() { errCh <- tm.mngr.Connect() }()
+	fc0, ok := gw.waitHealthy(0, 0, 0, 20*time.Second)
+	if !ok {
+		t.Fatal("shard 0 never became ready")
+	}
+	fc0.closeWith(4014, "Disallowed intent(s).")
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "shard 0") {
+			t.Fatalf("expected the startup to fail because of shard 0, got %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Connect did not return")
+	}
+	close(releaseShard1)
+	if ids := tm.running(); len(ids) != 0 {
+		t.Fatalf("every shard must be stopped, running: %v", ids)
+	}
+}
+
 // 30: with a long identify turn wait every shard has exactly one queue call, also across session deaths.
 func TestManager30_LongTurnWaitSingleQueueCall(t *testing.T) {
 	t.Parallel()
@@ -247,6 +375,91 @@ func TestManager30_LongTurnWaitSingleQueueCall(t *testing.T) {
 			t.Fatalf("shard %d: expected exactly one queue call, got %d", id, calls[id])
 		}
 	}
+}
+
+// 42: startup-failure cleanup, concurrent Disconnects and a new Connect: the cleanup is never overlapped by a new
+// run and never stops it; concurrent Disconnects wait for the same cleanup.
+func TestManager42_CleanupOwnership(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 300)
+	gw.mu.Lock()
+	gw.identifyCloseShard[1] = 4004
+	gw.mu.Unlock()
+	releaseShard1 := make(chan struct{})
+	queue := func(shardID uint, cb func() error) error {
+		if shardID == 1 {
+			<-releaseShard1
+		}
+		return cb()
+	}
+	tm := newTestManager(t, gw, []uint{0, 1}, func(conf *ShardManagerConfig) { conf.ConnectQueue = queue })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- tm.mngr.Connect() }()
+	fc0, ok := gw.waitHealthy(0, 0, 0, 20*time.Second)
+	if !ok {
+		t.Fatal("shard 0 never became ready")
+	}
+	// shard 0's server stops reading once the next heartbeat arrived, so its close handshake takes ~5s and the
+	// startup cleanup stays in progress meanwhile
+	fc0.frozen.Store(true)
+	if !waitFor(10*time.Second, func() bool { return gw.log.Count("frozen: dropping frame") > 0 }) {
+		t.Fatal("no frame after freezing")
+	}
+	close(releaseShard1)
+
+	// while the old startup cleans up: Disconnects coalesce and Connect can not overlap
+	if !waitFor(10*time.Second, func() bool {
+		tm.mngr.mu.RLock()
+		defer tm.mngr.mu.RUnlock()
+		m := tm.mngr.mrun
+		if m == nil {
+			t.Fatal("the cleanup finished too early for this test")
+		}
+		select {
+		case <-m.stopping:
+			return true
+		default:
+			return false
+		}
+	}) {
+		t.Fatal("startup failure never started the cleanup")
+	}
+	if err := tm.mngr.Connect(); !errors.Is(err, ErrStopping) {
+		t.Fatalf("expected ErrStopping while the old run is cleaned up, got %v", err)
+	}
+	var wg sync.WaitGroup
+	disconnectErrs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			disconnectErrs <- tm.mngr.Disconnect()
+		}()
+	}
+	wg.Wait()
+	close(disconnectErrs)
+	for err := range disconnectErrs {
+		if err != nil {
+			t.Fatalf("concurrent Disconnect: %v", err)
+		}
+	}
+	var closeErr *GatewayCloseError
+	if err := <-errCh; !errors.As(err, &closeErr) {
+		t.Fatalf("expected the startup to fail with 4004, got %v", err)
+	}
+
+	// a new run after the cleanup completed is never touched by it
+	minIdx := gw.connCount()
+	if err := tm.mngr.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	conns := tm.waitAll(minIdx, 3, 30*time.Second)
+	time.Sleep(500 * time.Millisecond)
+	if ids := tm.running(); len(ids) != 2 {
+		t.Fatalf("the new run was stopped, running: %v", ids)
+	}
+	tm.checkProbes(conns)
 }
 
 // E1: Emit holds the read lock and must never take it again; a pending writer would deadlock it.
@@ -327,5 +540,54 @@ func TestManager_ShardMapAccessorsLocked(t *testing.T) {
 	wg.Wait()
 	if n := len(tm.mngr.ShardIDs()); n != 20 {
 		t.Fatalf("expected 20 shards, got %d", n)
+	}
+}
+
+// S4 (B3, base: FAIL with "send on closed channel"): system shutdown while shards are starting.
+func TestManager_ShutdownWhileStarting(t *testing.T) {
+	t.Parallel()
+	gw := newScenario(t, 500)
+	gw.dropAfterWS.Store(2)
+	tm := newTestManager(t, gw, []uint{0, 1}, nil)
+	errCh := make(chan error, 1)
+	go func() { errCh <- tm.mngr.Connect() }()
+	if !waitFor(10*time.Second, func() bool { return gw.dialAttempts.Load() >= 2 }) {
+		t.Fatal("shards did not dial")
+	}
+	tm.closeShutdown()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected Connect to fail after the system shutdown")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Connect did not return after the system shutdown")
+	}
+	if !waitFor(10*time.Second, func() bool { return len(tm.running()) == 0 }) {
+		t.Fatalf("shards still running after shutdown: %v", tm.running())
+	}
+}
+
+// Review item 2: READY and termination are separate results; the barrier must never report success when a shard
+// already retired, and must report its terminal error.
+func TestManagerStartupRejectsRetiredShard(t *testing.T) {
+	fatal := newCloseError(4014)
+	for i := 0; i < 1000; i++ {
+		// A reaches READY and stops fatally before B reaches READY
+		a := &run{first: make(chan error, 1), done: make(chan struct{}), terminal: fatal}
+		a.first <- nil
+		close(a.done)
+		b := &run{first: make(chan error, 1), done: make(chan struct{})}
+		b.first <- nil
+		m := &mrun{
+			runs:     map[shardID]*run{0: a, 1: b},
+			stopping: make(chan struct{}),
+			stopped:  make(chan struct{}),
+		}
+		err := (&shardMngr{}).awaitStartup(m)
+		var closeErr *GatewayCloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != 4014 {
+			t.Fatalf("schedule %d: expected the retired shard's fatal error, got %v", i, err)
+		}
 	}
 }

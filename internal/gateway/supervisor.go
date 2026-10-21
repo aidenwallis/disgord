@@ -176,6 +176,7 @@ type run struct {
 	first     chan error
 	firstSent bool // supervisor goroutine only
 	done      chan struct{}
+	terminal  error // why the run ended; written before done is closed
 
 	stopping bool // guarded by EvtClient.lifecycleMu
 }
@@ -185,6 +186,11 @@ func (r *run) sendFirst(err error) {
 		r.firstSent = true
 		r.first <- err
 	}
+}
+
+// terminalErr is only valid once done is closed.
+func (r *run) terminalErr() error {
+	return r.terminal
 }
 
 func (r *run) waitFirst() error {
@@ -259,6 +265,17 @@ func (c *EvtClient) Disconnect() error {
 	return c.awaitStop(r)
 }
 
+// stopRun stops r if it is still the shard's run. Used by the shard manager, which must never stop a newer run.
+func (c *EvtClient) stopRun(r *run) error {
+	c.lifecycleMu.Lock()
+	if c.run == r {
+		c.markStopping(r)
+	}
+	c.lifecycleMu.Unlock()
+	r.cancel()
+	return c.awaitStop(r)
+}
+
 // markStopping must be called with lifecycleMu held. c.run is only cleared by the supervisor itself, so no new
 // run can start until this one has fully retired.
 func (c *EvtClient) markStopping(r *run) {
@@ -306,6 +323,7 @@ func (c *EvtClient) supervise(r *run) {
 			err := newCloseError(out.reason.code)
 			c.log.Error(c.getLogPrefix(), "shard stopped permanently:", err)
 			c.setState(stateStopped, fmt.Sprintf("close code %d", out.reason.code))
+			r.terminal = err
 			r.sendFirst(err)
 			return
 		}
@@ -355,6 +373,9 @@ func (c *EvtClient) retire(r *run) {
 	}
 	c.lifecycleMu.Unlock()
 
+	if r.terminal == nil {
+		r.terminal = ErrDisconnected
+	}
 	r.sendFirst(ErrDisconnected)
 	close(r.done)
 }
